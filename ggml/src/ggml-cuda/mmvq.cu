@@ -557,11 +557,23 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         }
         return generic;
     }
+    // RDNA2 (gfx1030) had no entry here and fell through to nwarps=1, i.e. every
+    // MMVQ dispatch ran as a single wave32 workgroup regardless of ncols_dst.
+    if (table_id == MMVQ_PARAMETERS_RDNA2) {
+        if (ncols_dst <= 4) {
+            return 4;
+        }
+        if (ncols_dst <= 8) {
+            return 2;
+        }
+        return 1;
+    }
     return 1;
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 ||
+        table_id == MMVQ_PARAMETERS_RDNA2) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
