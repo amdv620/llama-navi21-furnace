@@ -2589,7 +2589,9 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // nodes[0] alone is effectively constant across graphs of different shapes, which
+    // collapses the per-shape graph cache to a single entry. Mix in the node count.
+    return (const void *) ((uintptr_t) cgraph->nodes[0] ^ ((uintptr_t) cgraph->n_nodes << 32));
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

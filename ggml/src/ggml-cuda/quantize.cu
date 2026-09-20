@@ -512,13 +512,15 @@ static __global__ void quantize_mmq_q8_1(
         }
     }
 
-    const float d_inv = 127.0f / amax;
+    // amax == 0 (an all-zero group) would make d_inv inf and roundf(0*inf) undefined.
+    // quantize_q8_1 guards this; do the same here.
+    const float d_inv = amax == 0.0f ? 0.0f : 127.0f / amax;
     char4 q;
     q.x = roundf(xi.x*d_inv);
     q.y = roundf(xi.y*d_inv);
     q.z = roundf(xi.z*d_inv);
     q.w = roundf(xi.w*d_inv);
-    const float d = 1.0f / d_inv;
+    const float d = amax == 0.0f ? 0.0f : 1.0f / d_inv;
 
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;

@@ -512,6 +512,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     constexpr int ncols = ncols1*ncols2;
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
+    // cpw/np use integer division; if neither divides the other, Q columns are
+    // silently dropped (the kernel still compiles and reports a plausible VGPR count).
+    static_assert(ncols % nwarps == 0 || nwarps % ncols == 0, "ncols and nwarps must divide one another");
 
     flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
         (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
@@ -597,6 +600,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int ncols = ncols1*ncols2;
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
+    // cpw/np use integer division; if neither divides the other, Q columns are
+    // silently dropped (the kernel still compiles and reports a plausible VGPR count).
+    static_assert(ncols % nwarps == 0 || nwarps % ncols == 0, "ncols and nwarps must divide one another");
 
     constexpr int DVp = (DV + 2*warp_size - 1) & ~(2*warp_size - 1); // DV padded to multiple of 2*warp_size.
 
