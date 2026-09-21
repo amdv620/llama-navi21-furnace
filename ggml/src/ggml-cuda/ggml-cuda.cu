@@ -699,6 +699,11 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    // Release cached q8_1 buffers while the pools that own them are still alive.
+    // Members are destroyed in reverse declaration order, so `pools` would otherwise
+    // be torn down before `q8_1_cache` and trip GGML_ASSERT(pool_size == 0).
+    q8_1_cache.clear();
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
