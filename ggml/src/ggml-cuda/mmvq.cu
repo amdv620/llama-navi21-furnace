@@ -561,7 +561,13 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     // RDNA2 (gfx1030) had no entry here and fell through to nwarps=1, i.e. every
     // MMVQ dispatch ran as a single wave32 workgroup regardless of ncols_dst.
     if (table_id == MMVQ_PARAMETERS_RDNA2) {
-        if (ncols_dst <= 4) {
+        // ncols_dst == 1 (plain token generation) wants the wide block: 4 waves keep
+        // enough loads in flight to hold the memory roofline.
+        // ncols_dst 2..8 is the speculative-decoding verify shape, where each wave also
+        // carries ncols_dst accumulators. There 4 waves is counterproductive - 2 waves
+        // measured ~6% faster on the batch-4 shape and ~4% end-to-end on MTP (38.7 ->
+        // 40.2 t/s, reproducible over 3 interleaved passes).
+        if (ncols_dst == 1) {
             return 4;
         }
         if (ncols_dst <= 8) {
