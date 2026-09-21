@@ -31,6 +31,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <map>
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -1444,6 +1445,20 @@ struct ggml_cuda_concurrent_event {
     }
 };
 
+// Cache of quantized (q8_1) src1 buffers, valid within a single graph evaluation.
+// quantize_row_q8_1_cuda ignores src0's type, so several MUL_MAT nodes that share the
+// same src1 would otherwise re-quantize byte-identical data.
+struct ggml_cuda_q8_1_cache {
+    using key_t = std::array<int64_t, 10>;
+    std::map<key_t, char *>                                  ptrs;
+    std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> allocs;
+
+    void clear() {
+        ptrs.clear();
+        allocs.clear();
+    }
+};
+
 struct ggml_cuda_stream_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
 
@@ -1522,6 +1537,7 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+    ggml_cuda_q8_1_cache     q8_1_cache;   // cleared at the start of every graph evaluation
 
     ~ggml_backend_cuda_context();
 

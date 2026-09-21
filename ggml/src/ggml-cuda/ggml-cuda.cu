@@ -4424,6 +4424,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // q8_1 buffers are only reusable within one graph evaluation
+    cuda_ctx->q8_1_cache.clear();
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
