@@ -563,14 +563,15 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     if (table_id == MMVQ_PARAMETERS_RDNA2) {
         // ncols_dst == 1 (plain token generation) wants the wide block: 4 waves keep
         // enough loads in flight to hold the memory roofline.
-        // ncols_dst 2..8 is the speculative-decoding verify shape, where each wave also
-        // carries ncols_dst accumulators. There 4 waves is counterproductive - 2 waves
-        // measured ~6% faster on the batch-4 shape and ~4% end-to-end on MTP (38.7 ->
-        // 40.2 t/s, reproducible over 3 interleaved passes).
+        // ncols_dst > 1 is the speculative-decoding verify shape, where every wave also
+        // carries ncols_dst accumulators, so wide blocks stop paying. Measured on V620
+        // with Qwen3.5-27B (see calc_rows_per_block for the paired row counts):
+        //   2..4 (MTP, block 4):    nwarps 4 -> 2  = +6.3% on the batch-4 shape
+        //   5..8 (DFlash, block 8): nwarps 2 -> 1  = +7.6% on the batch-8 shape
         if (ncols_dst == 1) {
             return 4;
         }
-        if (ncols_dst <= 8) {
+        if (ncols_dst <= 4) {
             return 2;
         }
         return 1;
@@ -579,8 +580,28 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
 }
 
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
-    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10 ||
-        table_id == MMVQ_PARAMETERS_RDNA2) {
+    if (table_id == MMVQ_PARAMETERS_RDNA2) {
+        switch (ncols_dst) {
+            case 1:
+                return small_k ? nwarps : 1;
+            case 2:
+            case 3:
+            case 4:
+                return 2;
+            // 5..8 is the block-drafter verify shape (DFlash block_size=8 -> 8 rows).
+            // Widening the block to 4 output rows amortises the 8 y-columns that every
+            // wave already holds in registers; rows_per_block=8 regresses and, at
+            // nwarps=1, fails test-backend-ops.
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 4;
+            default:
+                return 1;
+        }
+    }
+    if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
                 return small_k ? nwarps : 1;
