@@ -1199,7 +1199,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.pos0;
 
-            const int32_t n_draft = params.n_max;
+            const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1697,7 +1697,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if ((params.n_max <= (int) result.size()) ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2190,6 +2191,16 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // adaptive draft length state
+    // acceptance is strongly workload dependent (measured on Qwen3.5-27B + DFlash2:
+    // ~5.3 accepted/step on GSM8K-style math, ~2.2 on code, ~1.7 on long reasoning
+    // prose), and a draft longer than the target will accept is not free - it widens
+    // the verification batch, which is ~88% of an iteration. Track how many draft
+    // tokens are actually being accepted and size the next draft from that.
+    std::vector<float> acc_ema;      // per-seq EMA of accepted draft tokens
+    int32_t            n_max_cap = 0;
+    bool               adaptive  = false;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2735,6 +2746,23 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
+
+    // Start optimistic (full depth) and let the first few steps pull it down.
+    // Only engage when the configured cap leaves real room to tune: a small cap is
+    // usually already at its optimum (MTP defaults to 3, which measured best on every
+    // workload tried), so there the controller can only wander off it - it cost 4% on
+    // code generation before this guard. Block drafters with a cap of 7+ are where the
+    // spread between workloads is worth chasing.
+    constexpr int32_t n_max_adaptive_min = 4;
+
+    result->n_max_cap = n_max_effective;
+    result->adaptive  = n_max_effective >= n_max_adaptive_min &&
+                        getenv("LLAMA_SPEC_NO_ADAPTIVE") == nullptr;
+    result->acc_ema.assign(n_seq, (float) n_max_effective);
+    if (result->adaptive) {
+        SPC_INF("adaptive draft length enabled (cap = %d, set LLAMA_SPEC_NO_ADAPTIVE=1 to disable)\n",
+                n_max_effective);
+    }
     const auto rates = common_speculative_synth_rates_resolve(&params, n_max_effective);
 
     std::vector<std::string> rates_str;
@@ -2827,6 +2855,45 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // effective per-sequence draft cap for this round
+    std::vector<int32_t> n_max_eff(dparams.size(), -1);
+    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+        auto & dp = dparams[seq_id];
+
+        n_max_eff[seq_id] = dp.n_max;
+
+        if (!spec->adaptive || !dp.drafting) {
+            continue;
+        }
+
+        // Draft a little past what recent history says will be accepted. The margin is
+        // multiplicative so it widens when acceptance is high - there the extra rows earn
+        // what they add to the verification batch - and tightens when acceptance is low,
+        // where an over-long draft only inflates that batch. The +1 lets it climb back:
+        // if everything drafted is accepted the EMA rises and so does the cap.
+        //
+        // Deliberately kept this simple. A censoring correction (treat a fully accepted
+        // draft as evidence of "at least n") and a hysteresis deadband were both tried
+        // and both lost on a four-workload mean: 53.6 for this, 52.9 with censoring,
+        // 51.5 with both - censoring plus hysteresis collapsed code generation to ~45.
+        const int32_t adaptive = std::clamp(
+                (int32_t) std::lround(spec->acc_ema[seq_id] * 1.3f) + 1, 1, spec->n_max_cap);
+
+        n_max_eff[seq_id] = dp.n_max > 0 ? std::min(dp.n_max, adaptive) : adaptive;
+    }
+
+    // publish the cap on dp.n_max for the duration of the draft: implementations that
+    // can size their draft up front (MTP's step count, DFlash's block width) read it
+    // there - that is the existing convention, see the draft-simple impl - and do
+    // strictly less work. Truncating the result afterwards instead is a net loss: the
+    // drafter has already paid for the discarded positions, so it costs acceptance and
+    // saves only the verify rows.
+    std::vector<int32_t> n_max_saved(dparams.size());
+    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+        n_max_saved[seq_id] = dparams[seq_id].n_max;
+        dparams[seq_id].n_max = n_max_eff[seq_id];
+    }
+
     for (auto & impl : spec->impls) {
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
@@ -2849,10 +2916,11 @@ void common_speculative_draft(common_speculative * spec) {
             if (dp.drafting && !result.empty()) {
                 dp.drafting = false;
 
-                if (dp.n_max > 0) {
-                    if (!result.empty() && (int) result.size() > dp.n_max) {
-                        SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
-                        result.resize(dp.n_max);
+                const int32_t n_max_cur = n_max_eff[seq_id];
+                if (n_max_cur > 0) {
+                    if (!result.empty() && (int) result.size() > n_max_cur) {
+                        SPC_DBG("truncating draft to %d tokens\n", n_max_cur);
+                        result.resize(n_max_cur);
                     }
                 }
 
@@ -2866,6 +2934,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
+
                 }
             }
 
@@ -2877,6 +2946,10 @@ void common_speculative_draft(common_speculative * spec) {
         if (n_drafting == 0) {
             break;
         }
+    }
+
+    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) dparams.size(); ++seq_id) {
+        dparams[seq_id].n_max = n_max_saved[seq_id];
     }
 
     // these sequences failed to generate a draft
@@ -2915,6 +2988,13 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
+    }
+
+    // a draft was actually used for this sequence, so n_accepted is a real observation
+    if (spec->adaptive && seq_id >= 0 && seq_id < (llama_seq_id) spec->acc_ema.size()) {
+        constexpr float alpha = 0.2f; // ~15 steps to converge; fast enough to follow a
+                                      // switch between prose and code mid-generation
+        spec->acc_ema[seq_id] = (1.0f - alpha)*spec->acc_ema[seq_id] + alpha*(float) n_accepted;
     }
 
     // accept with the rest of the implementations, using is_other == true
