@@ -31,7 +31,7 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <map>
+#include <deque>
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -1448,14 +1448,44 @@ struct ggml_cuda_concurrent_event {
 // Cache of quantized (q8_1) src1 buffers, valid within a single graph evaluation.
 // quantize_row_q8_1_cuda ignores src0's type, so several MUL_MAT nodes that share the
 // same src1 would otherwise re-quantize byte-identical data.
+//
+// The cache is deliberately small. Every entry pins a pool allocation, and a captured
+// CUDA graph bakes those addresses in. The first version kept one entry per distinct src1
+// for the whole graph (~257 at single-token decode, far more with multi-sequence
+// batches) and released them together at the next evaluation. That overflowed the legacy
+// pool's 256-slot free list, the excess was cudaFree'd while a captured graph still
+// referenced it, and the next replay page-faulted. The consumers that share a src1 (q/k/v,
+// gate/up, the delta-net input projections) are adjacent in the graph, so a handful of
+// entries still catch the reuse while keeping the number of live buffers as small as
+// upstream's free-after-every-op scheme.
 struct ggml_cuda_q8_1_cache {
-    using key_t = std::array<int64_t, 10>;
-    std::map<key_t, char *>                                  ptrs;
-    std::vector<std::unique_ptr<ggml_cuda_pool_alloc<char>>> allocs;
+    using key_t = std::array<int64_t, 11>;
+    static constexpr size_t capacity = 8;
+
+    struct entry {
+        key_t                                       key;
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> alloc;
+    };
+    std::deque<entry> entries;
+
+    char * find(const key_t & key) const {
+        for (const entry & e : entries) {
+            if (e.key == key) {
+                return e.alloc->get();
+            }
+        }
+        return nullptr;
+    }
+
+    void insert(const key_t & key, std::unique_ptr<ggml_cuda_pool_alloc<char>> alloc) {
+        if (entries.size() == capacity) {
+            entries.pop_front(); // oldest entry: its buffer goes back to the pool now, as upstream would
+        }
+        entries.push_back({ key, std::move(alloc) });
+    }
 
     void clear() {
-        ptrs.clear();
-        allocs.clear();
+        entries.clear();
     }
 };
 

@@ -1528,25 +1528,23 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t q_s13 = src1->nb[3] / ts_src1;
 
     static const bool q8_1_cache_off = getenv("GGML_CUDA_NO_Q8_1_CACHE") != nullptr;
+    // the stream is part of the key: with concurrent streams a hit from another stream would
+    // read the buffer without waiting for the quantize that fills it
     const ggml_cuda_q8_1_cache::key_t q8_1_key = {
         (int64_t) (uintptr_t) src1, (int64_t) (uintptr_t) src1_d,
-        ne10, ne11, ne12, ne13, q_s11, q_s12, q_s13, ne10_padded };
+        ne10, ne11, ne12, ne13, q_s11, q_s12, q_s13, ne10_padded, (int64_t) ctx.curr_stream_no };
 
     std::unique_ptr<ggml_cuda_pool_alloc<char>> q8_1_owned;
     char * src1_q8_1_ptr = nullptr;
     if (!q8_1_cache_off) {
-        auto it = ctx.q8_1_cache.ptrs.find(q8_1_key);
-        if (it != ctx.q8_1_cache.ptrs.end()) {
-            src1_q8_1_ptr = it->second;
-        }
+        src1_q8_1_ptr = ctx.q8_1_cache.find(q8_1_key);
     }
     if (src1_q8_1_ptr == nullptr) {
         q8_1_owned    = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_1_nbytes);
         src1_q8_1_ptr = q8_1_owned->get();
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, q_s11, q_s12, q_s13, ne10_padded, ne11, ne12, ne13, stream);
         if (!q8_1_cache_off) {
-            ctx.q8_1_cache.ptrs[q8_1_key] = src1_q8_1_ptr;
-            ctx.q8_1_cache.allocs.push_back(std::move(q8_1_owned));
+            ctx.q8_1_cache.insert(q8_1_key, std::move(q8_1_owned));
         }
     }
 
