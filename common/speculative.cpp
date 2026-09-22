@@ -2193,7 +2193,7 @@ struct common_speculative {
     std::vector<double> synth_probs;
 
     // adaptive draft length state
-    // acceptance is strongly workload dependent (measured on Qwen3.5-27B + DFlash2:
+    // acceptance is strongly workload dependent (measured on Qwen3.8-27B + DFlash2:
     // ~5.3 accepted/step on GSM8K-style math, ~2.2 on code, ~1.7 on long reasoning
     // prose), and a draft longer than the target will accept is not free - it widens
     // the verification batch, which is ~88% of an iteration. Track how many draft
@@ -2749,10 +2749,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
     // Start optimistic (full depth) and let the first few steps pull it down.
     // Only engage when the configured cap leaves real room to tune: a small cap is
-    // usually already at its optimum (MTP defaults to 3, which measured best on every
-    // workload tried), so there the controller can only wander off it - it cost 4% on
-    // code generation before this guard. Block drafters with a cap of 7+ are where the
-    // spread between workloads is worth chasing.
+    // usually already at its optimum (MTP defaults to 3; on math, code and prose, fixed
+    // 3 beat both fixed 5 and adaptive with a cap of 5), so there the controller can
+    // only wander off it - it cost 4% on code generation before this guard. Block
+    // drafters with a cap of 7+ are where the spread between workloads is worth chasing.
     constexpr int32_t n_max_adaptive_min = 4;
 
     result->n_max_cap = n_max_effective;

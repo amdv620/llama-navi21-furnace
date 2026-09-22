@@ -565,7 +565,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
         // enough loads in flight to hold the memory roofline.
         // ncols_dst > 1 is the speculative-decoding verify shape, where every wave also
         // carries ncols_dst accumulators, so wide blocks stop paying. Measured on V620
-        // with Qwen3.5-27B (see calc_rows_per_block for the paired row counts):
+        // with Qwen3.8-27B (see calc_rows_per_block for the paired row counts):
         //   2..4 (MTP, block 4):    nwarps 4 -> 2  = +6.3% on the batch-4 shape
         //   5..8 (DFlash, block 8): nwarps 2 -> 1  = +7.6% on the batch-8 shape
         if (ncols_dst == 1) {
@@ -590,8 +590,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
                 return 2;
             // 5..8 is the block-drafter verify shape (DFlash block_size=8 -> 8 rows).
             // Widening the block to 4 output rows amortises the 8 y-columns that every
-            // wave already holds in registers; rows_per_block=8 regresses and, at
-            // nwarps=1, fails test-backend-ops.
+            // wave already holds in registers; rows_per_block=8 regresses (pp8 89.8
+            // vs 120.5 t/s).
             case 5:
             case 6:
             case 7:
