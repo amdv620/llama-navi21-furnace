@@ -2811,6 +2811,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         return;
     }
 
+    // a new request on this sequence: forget the previous request's acceptance and start
+    // optimistic again, otherwise a code request that pulled the cap down would leave the
+    // next (possibly high-acceptance) request drafting short until the EMA recovers
+    if (spec->adaptive && seq_id >= 0 && seq_id < (llama_seq_id) spec->acc_ema.size()) {
+        spec->acc_ema[seq_id] = (float) spec->n_max_cap;
+    }
+
     for (auto & impl : spec->impls) {
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
