@@ -90,6 +90,18 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
     };
 
+    // reduced draft vocabulary for the MTP head (optional, same convention as DFlash): d2t maps
+    // the rows of nextn.shared_head_head to target token ids, so the head - which the drafter
+    // reads once per draft step - only holds the K most likely tokens instead of all 248k
+    int64_t n_vocab_head = n_vocab;
+    if (const ggml_tensor * d2t_meta = ml.get_tensor_meta("d2t")) {
+        n_vocab_head = d2t_meta->ne[0];
+        d2t = create_tensor(tn(LLM_TENSOR_D2T), { n_vocab_head }, mtp_flags);
+        if (ml.load_mtp) {
+            LLAMA_LOG_INFO("%s: MTP head using d2t mapping (draft_vocab_size = %lld)\n", __func__, (long long) n_vocab_head);
+        }
+    }
+
     auto load_block_mtp = [&](int il) {
         auto & layer = layers[il];
 
@@ -111,7 +123,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
         layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
         layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab_head }, mtp_flags|(d2t ? 0 : TENSOR_NOT_REQUIRED));
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
@@ -636,6 +648,23 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
+
+    // reduced draft vocabulary: scatter the head's logits to the target vocabulary via d2t
+    if (model.d2t) {
+        GGML_ASSERT(head_w == layer.nextn.shared_head_head && "QWEN35 MTP: d2t requires nextn.shared_head_head");
+        const int64_t n_draft_vocab = cur->ne[0];
+        const int64_t n_outputs     = cur->ne[1];
+        const int64_t n_vocab       = (int64_t) model.vocab.n_tokens();
+
+        GGML_ASSERT(model.d2t->type == GGML_TYPE_I64);
+        GGML_ASSERT(model.d2t->ne[0] == n_draft_vocab);
+
+        ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab, n_outputs), -INFINITY);
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, cur,       1,             n_draft_vocab, n_outputs),
+                ggml_reshape_3d(ctx0, model.d2t, n_draft_vocab, 1,             1));
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab, n_outputs);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
