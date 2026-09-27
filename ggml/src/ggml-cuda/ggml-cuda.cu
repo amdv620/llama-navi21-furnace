@@ -2595,8 +2595,18 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // nodes[0] alone is effectively constant across graphs of different shapes, which
-    // collapses the per-shape graph cache to a single entry. Mix in the node count.
-    return (const void *) ((uintptr_t) cgraph->nodes[0] ^ ((uintptr_t) cgraph->n_nodes << 32));
+    // collapses the per-shape graph cache to a single entry. Graphs that differ only in
+    // their batch size (e.g. speculative verification with a varying draft length) also
+    // share the node count, so mix in the shapes of the first and last node as well:
+    // otherwise every size change evicts the cached graph, drops to direct execution
+    // and re-captures once the size has been stable for two calls.
+    uint64_t h = (uint64_t) (uintptr_t) cgraph->nodes[0] ^ ((uint64_t) cgraph->n_nodes << 32);
+    for (const ggml_tensor * t : { cgraph->nodes[0], cgraph->nodes[cgraph->n_nodes - 1] }) {
+        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+            h = (h ^ (uint64_t) t->ne[i]) * 0x100000001b3ull; // FNV-1a step
+        }
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
