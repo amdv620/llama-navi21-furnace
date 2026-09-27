@@ -3778,6 +3778,56 @@ struct test_rms_norm_scale : public test_case {
     }
 };
 
+// ADD(row bias) -> [reshape] -> SOFTPLUS -> MUL(row scale): the gated delta-net decay gate
+struct test_add_softplus_mul : public test_case {
+    const int64_t n;
+    const int64_t n_tokens;
+    const bool    reshape;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_SOFTPLUS_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, n_tokens, reshape);
+    }
+
+    test_add_softplus_mul(int64_t n = 48, int64_t n_tokens = 4, bool reshape = false)
+        : n(n), n_tokens(n_tokens), reshape(reshape) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n_tokens);
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+        ggml_set_param(x);
+        ggml_set_name(x, "x");
+        ggml_set_param(bias);
+        ggml_set_name(bias, "bias");
+        ggml_set_param(scale);
+        ggml_set_name(scale, "scale");
+
+        // use scale early, so no OP_NONE for it lands inside the pattern
+        x = ggml_mul(ctx, x, scale);
+
+        ggml_tensor * cur = ggml_add(ctx, x, bias);
+        if (reshape) {
+            cur = ggml_reshape_3d(ctx, cur, n, 1, n_tokens);
+        }
+        cur = ggml_mul(ctx, ggml_softplus(ctx, cur), scale);
+        ggml_set_name(cur, "out");
+        return cur;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -25.0f, 25.0f); // both branches of softplus
+        }
+    }
+};
+
 // residual add -> RMS_NORM -> MUL(weight), with the sum used again as the next residual
 struct test_add_rms_norm_mul : public test_case {
     const std::array<int64_t, 4> ne;
@@ -9895,6 +9945,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
         }
+    }
+    for (bool reshape : { false, true }) {
+        test_cases.emplace_back(new test_add_softplus_mul(48, 1, reshape));
+        test_cases.emplace_back(new test_add_softplus_mul(48, 4, reshape));
+        test_cases.emplace_back(new test_add_softplus_mul(100, 7, reshape));
     }
     for (uint32_t n : {64, 1025, 5120}) {
         test_cases.emplace_back(new test_add_rms_norm_mul({ n, 1, 1, 1 }));

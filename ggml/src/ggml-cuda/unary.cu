@@ -719,3 +719,28 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+// ADD(bias) -> SOFTPLUS -> MUL(scale), bias and scale one row broadcast over all rows: the gated
+// delta-net decay gate softplus(alpha + dt) * A for a batch of tokens. Same operations as the
+// three separate kernels, so bit-identical.
+static __global__ void add_softplus_mul_f32(const float * x, const float * bias, const float * scale,
+                                            float * dst, const int n, const int64_t k) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int c = i % n;
+    dst[i] = op_softplus(x[i] + bias[c]) * scale[c];
+}
+
+void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * mul) {
+    const ggml_tensor * x     = add->src[0];
+    const ggml_tensor * bias  = add->src[1];
+    const ggml_tensor * scale = mul->src[1];
+    const int64_t k = ggml_nelements(mul);
+    const int     n = (int) x->ne[0];
+    const int     block = 256;
+    add_softplus_mul_f32<<<(k + block - 1) / block, block, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) bias->data, (const float *) scale->data, (float *) mul->data, n, k);
+    CUDA_CHECK(cudaGetLastError());
+}

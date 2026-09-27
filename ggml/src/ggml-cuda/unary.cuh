@@ -121,3 +121,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+// fused ADD(row-broadcast bias) -> SOFTPLUS -> MUL(row-broadcast scale) (see ggml_cuda_try_fuse)
+void ggml_cuda_op_add_softplus_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * mul);

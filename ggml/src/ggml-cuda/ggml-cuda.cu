@@ -3576,6 +3576,61 @@ static bool ggml_cuda_can_fuse_add_rms_norm_mul(const ggml_cgraph * cgraph, int 
     return !overlap(add, mul) || add->data == mul->data;
 }
 
+// ADD(bias) -> [reshape] -> SOFTPLUS -> MUL(scale) where bias and scale are a single row broadcast
+// over all rows (gated delta-net decay gate). Returns the index of the MUL, or -1.
+static int ggml_cuda_find_add_softplus_mul(const ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * add = cgraph->nodes[i];
+    if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    // walk to the next compute node, through reshape views of the running result
+    auto next = [&](int j, const ggml_tensor * prev) -> int {
+        for (++j; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_RESHAPE && n->src[0] == prev && ggml_cuda_tensor_use_count(cgraph, n) == 1) {
+                prev = n;
+                continue;
+            }
+            return (n->src[0] == prev) ? j : -1;
+        }
+        return -1;
+    };
+    const int j = next(i, add);
+    if (j < 0 || cgraph->nodes[j]->op != GGML_OP_UNARY || ggml_get_unary_op(cgraph->nodes[j]) != GGML_UNARY_OP_SOFTPLUS) {
+        return -1;
+    }
+    const int k = next(j, cgraph->nodes[j]);
+    if (k < 0 || cgraph->nodes[k]->op != GGML_OP_MUL) {
+        return -1;
+    }
+    const ggml_tensor * sp  = cgraph->nodes[j];
+    const ggml_tensor * mul = cgraph->nodes[k];
+    const ggml_tensor * x = add->src[0], * bias = add->src[1], * scale = mul->src[1];
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ x, bias, scale, sp, mul }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return -1;
+        }
+    }
+    if (ggml_cuda_tensor_use_count(cgraph, add) != 1 || ggml_cuda_tensor_use_count(cgraph, sp) != 1 ||
+            (add->flags & GGML_TENSOR_FLAG_OUTPUT) || (sp->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return -1;
+    }
+    if (ggml_nelements(x) != ggml_nelements(mul) || !ggml_are_same_shape(x, add) ||
+            bias->ne[0] != x->ne[0] || ggml_nrows(bias) != 1 || scale->ne[0] != x->ne[0] || ggml_nrows(scale) != 1) {
+        return -1;
+    }
+    // elementwise: the result may take x's place exactly, never part of it or the vectors
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+        const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+        return a0 < b1 && b0 < a1;
+    };
+    if ((overlap(mul, x) && mul->data != x->data) || overlap(mul, bias) || overlap(mul, scale)) {
+        return -1;
+    }
+    return k;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4288,6 +4343,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
         return 2;
+    }
+
+    if (node->op == GGML_OP_ADD) {
+        const int k = ggml_cuda_find_add_softplus_mul(cgraph, i);
+        if (k > 0) {
+            ggml_cuda_op_add_softplus_mul(*cuda_ctx, node, cgraph->nodes[k]);
+            return k - i;
+        }
     }
 
     if (ggml_cuda_can_fuse_add_rms_norm_mul(cgraph, i)) {
