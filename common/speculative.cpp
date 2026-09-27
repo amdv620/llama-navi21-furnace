@@ -1372,6 +1372,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
+    std::mt19937 rng { 0x5eed }; // sampled drafts (params.temp > 0)
+
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
 
@@ -1658,6 +1660,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
+            if (dp.probs) {
+                dp.probs->clear();
+            }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
@@ -1717,8 +1722,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                llama_token id = cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1728,10 +1736,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
+                // sampled drafts: draw from softmax(logits / temp) over the top-k candidates
+                if (dp.sample && params.temp > 0.0f && dp.probs != nullptr && cur_p->size > 0) {
+                    const size_t n_cand = cur_p->size;
+                    std::vector<double> q(n_cand);
+                    double l_max = cur_p->data[0].logit;
+                    for (size_t k = 1; k < n_cand; ++k) {
+                        l_max = std::max(l_max, (double) cur_p->data[k].logit);
+                    }
+                    double sum = 0.0;
+                    for (size_t k = 0; k < n_cand; ++k) {
+                        q[k] = std::exp(((double) cur_p->data[k].logit - l_max) / params.temp);
+                        sum += q[k];
+                    }
+                    const double tgt = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * sum;
+                    double run = 0.0;
+                    for (size_t k = 0; k < n_cand; ++k) {
+                        run += q[k];
+                        if (run >= tgt) {
+                            id = cur_p->data[k].id;
+                            break;
+                        }
+                    }
+                    std::vector<llama_token_data> dist(n_cand);
+                    for (size_t k = 0; k < n_cand; ++k) {
+                        dist[k] = { cur_p->data[k].id, cur_p->data[k].logit, (float) (q[k] / sum) };
+                    }
+                    dp.probs->push_back(std::move(dist));
+                }
 
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
+                common_sampler_accept(smpl, id, true);
 
                 result.push_back(id);
 
@@ -1785,6 +1819,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+                if (dp.probs) {
+                    dp.probs->clear();
+                }
             }
         }
     }

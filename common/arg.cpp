@@ -4190,7 +4190,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--spec-draft-temp"}, "T",
         string_format("when a request samples (temp > 0), draw draft tokens from the drafter's distribution at temperature T\n"
-                      "and verify them with speculative sampling; the output distribution is unchanged (DFlash2 only, 0 = off) (default: %.2f)",
+                      "and verify them with speculative sampling; the output distribution is unchanged (DFlash2 and MTP, 0 = off) (default: %.2f)",
                       (double)params.speculative.draft.temp),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.temp = std::stof(value);
