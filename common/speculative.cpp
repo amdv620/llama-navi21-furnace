@@ -929,6 +929,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
+    std::mt19937 rng { 0x5eed }; // sampled drafts (params.temp > 0)
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -1237,20 +1239,53 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
 
+                // sampled drafts: position i's distribution is softmax(scores / temp) over its
+                // top-k candidates, conditioned on the candidate drawn at i-1
+                const bool sample = dp.sample && params.temp > 0.0f && dp.probs != nullptr;
+                if (dp.probs) {
+                    dp.probs->clear();
+                }
+                std::vector<double> q(selector_top_k);
+
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
-                    predecessor = (int32_t) std::distance(scores,
+                    const int32_t k_max = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
+                    predecessor = k_max;
+                    if (sample) {
+                        double sum = 0.0;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            q[k] = std::exp(((double) scores[k] - scores[k_max]) / params.temp);
+                            sum += q[k];
+                        }
+                        const double tgt = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * sum;
+                        double run = 0.0;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            run += q[k];
+                            if (run >= tgt) {
+                                predecessor = k;
+                                break;
+                            }
+                        }
+                        std::vector<llama_token_data> dist(selector_top_k);
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            dist[k] = { (llama_token) row[k], scores[k], (float) (q[k] / sum) };
+                        }
+                        dp.probs->push_back(std::move(dist));
+                    }
                     if (params.p_min > 0.0f) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
-                            sum += std::exp(scores[k] - scores[predecessor]);
+                            sum += std::exp(scores[k] - scores[k_max]);
                         }
                         if (1.0f / sum < params.p_min) {
+                            if (sample) {
+                                dp.probs->pop_back();
+                            }
                             break;
                         }
                     }
@@ -1259,6 +1294,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 if (result.size() < (size_t) params.n_min) {
                     result.clear();
+                    if (dp.probs) {
+                        dp.probs->clear();
+                    }
                 }
                 continue;
             }
@@ -2928,6 +2966,9 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > n_max_cur) {
                         SPC_DBG("truncating draft to %d tokens\n", n_max_cur);
                         result.resize(n_max_cur);
+                        if (dp.probs && dp.probs->size() > result.size()) {
+                            dp.probs->resize(result.size());
+                        }
                     }
                 }
 

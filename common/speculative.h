@@ -69,6 +69,12 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // sample the draft from the drafter's distribution instead of taking its argmax (only drafters that
+    // support it; see common_params_speculative_draft::temp). when they do, probs[i] receives the
+    // distribution draft token i was sampled from; otherwise probs is left empty.
+    bool sample = false;
+    std::vector<std::vector<llama_token_data>> * probs = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

@@ -258,6 +258,13 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // speculative sampling: drafts sampled from the drafter's distribution (spec_draft_q) and verified
+    // with p/q acceptance instead of exact match - see common_params_speculative_draft::temp
+    bool spec_sample = false;
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
+    std::mt19937 spec_rng;
+    common_sampler_spec_stats spec_stats;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -394,6 +401,7 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        spec_stats = {};
 
         n_predict_max = -1;
 
@@ -678,6 +686,12 @@ struct server_slot {
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
+        }
+
+        if (spec_stats.n_pos > 0) {
+            SLT_INF(*this,
+                    "spec sampling: %lld positions, mean sum min(p,q) = %.4f, mean p(argmax q) = %.4f\n",
+                    (long long) spec_stats.n_pos, spec_stats.sum_min / spec_stats.n_pos, spec_stats.sum_greedy / spec_stats.n_pos);
         }
 
         common_speculative_print_stats(spec);
@@ -1809,6 +1823,17 @@ private:
                     ? std::random_device{}()
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
+            }
+
+            {
+                const auto & sp = task.params.sampling;
+                slot.spec_sample = spec && params_base.speculative.draft.temp > 0.0f &&
+                    sp.temp > 0.0f && sp.mirostat == 0 &&
+                    std::find(sp.samplers.begin(), sp.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == sp.samplers.end();
+                if (slot.spec_sample) {
+                    slot.spec_rng.seed(sp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : sp.seed + 1);
+                }
+                slot.spec_draft_q.clear();
             }
         } else {
             slot.smpl.reset();
@@ -3025,6 +3050,8 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        slot.spec_draft_q.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3032,6 +3059,8 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .sample   = */ slot.spec_sample,
+                            /* .probs    = */ &slot.spec_draft_q,
                         };
 
                         drafting.push_back(&slot);
@@ -3912,12 +3941,21 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : server_sample_and_accept_synth(
+                // a replay after a checkpoint restore repeats decisions made by the p/q path, which the
+                // exact-match path would not reproduce, so it goes through the p/q path as well
+                const bool use_spec_sampling = slot.spec_sample &&
+                    (slot.spec_is_replay || slot.spec_draft_q.size() >= slot.spec_draft.size());
+                auto accepted = !synth_probs.empty()
+                    ? server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
+                    : use_spec_sampling
+                    ? common_sampler_sample_and_accept_n_spec(
+                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q,
+                            slot.spec_rng, slot.spec_is_replay, &slot.spec_stats)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
+                slot.spec_draft_q.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 

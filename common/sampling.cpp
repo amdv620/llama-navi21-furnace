@@ -714,6 +714,150 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+static double spec_q_of(const std::vector<llama_token_data> & q, llama_token id) {
+    double res = 0.0;
+    for (const auto & e : q) {
+        if (e.id == id) {
+            res += e.p;
+        }
+    }
+    return res;
+}
+
+llama_token common_sampler_spec_step(const llama_token_data_array & cur_p, const std::vector<llama_token_data> & q,
+        llama_token x, std::mt19937 & rng, bool & accepted, common_sampler_spec_stats * stats) {
+    GGML_ASSERT(cur_p.size > 0);
+
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+
+    double p_x = 0.0;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        if (cur_p.data[i].id == x) {
+            p_x += cur_p.data[i].p;
+        }
+    }
+    const double q_x = spec_q_of(q, x);
+
+    // sum_t min(p_t, q_t) - only tokens in q contribute
+    double sum_min = 0.0;
+    for (const auto & e : q) {
+        double p_t = 0.0;
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            if (cur_p.data[i].id == e.id) {
+                p_t += cur_p.data[i].p;
+            }
+        }
+        sum_min += std::min<double>(p_t, e.p);
+    }
+
+    if (stats) {
+        const auto it = std::max_element(q.begin(), q.end(),
+                [](const llama_token_data & a, const llama_token_data & b) { return a.p < b.p; });
+        double p_greedy = 0.0;
+        if (it != q.end()) {
+            for (size_t i = 0; i < cur_p.size; ++i) {
+                if (cur_p.data[i].id == it->id) {
+                    p_greedy += cur_p.data[i].p;
+                }
+            }
+        }
+        stats->n_pos      += 1;
+        stats->sum_min    += sum_min;
+        stats->sum_greedy += p_greedy;
+    }
+
+    // q_x == 0 cannot happen for a token sampled from q; treat it as a rejection
+    if (q_x > 0.0 && dist(rng) * q_x < p_x) {
+        accepted = true;
+        return x;
+    }
+
+    accepted = false;
+
+    // residual distribution norm(max(0, p - q)), its mass is 1 - sum_min
+    double total = 0.0;
+    std::vector<double> r(cur_p.size);
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        r[i] = std::max(0.0, (double) cur_p.data[i].p - spec_q_of(q, cur_p.data[i].id));
+        total += r[i];
+    }
+
+    if (total <= 1e-9) {
+        // p and q (numerically) agree everywhere, so a rejection has probability ~0; sample from p
+        for (size_t i = 0; i < cur_p.size; ++i) {
+            r[i] = cur_p.data[i].p;
+        }
+        total = 1.0;
+    }
+
+    const double tgt = dist(rng) * total;
+    double run = 0.0;
+    for (size_t i = 0; i < cur_p.size; ++i) {
+        run += r[i];
+        if (r[i] > 0.0 && run >= tgt) {
+            return cur_p.data[i].id;
+        }
+    }
+
+    // rounding: return the last token with residual mass
+    for (size_t i = cur_p.size; i-- > 0;) {
+        if (r[i] > 0.0) {
+            return cur_p.data[i].id;
+        }
+    }
+
+    return cur_p.data[0].id;
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n_spec(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
+        std::mt19937 & rng, bool is_replay, common_sampler_spec_stats * stats) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT((is_replay || draft_q.size() >= draft.size()) && "draft_q must cover the draft");
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); i++) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i]);
+
+        if (is_replay) {
+            common_sampler_accept(gsmpl, draft[i], true);
+            result.push_back(draft[i]);
+            continue;
+        }
+
+        // with a grammar or a backend-selected token, cur_p is not the distribution id was drawn from:
+        // verify by exact match, which is still exact for any draft
+        if (grammar_should_apply(gsmpl) || llama_get_sampled_token_ith(ctx, idxs[i]) != LLAMA_TOKEN_NULL) {
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            if (draft[i] != id) {
+                return result;
+            }
+            continue;
+        }
+
+        bool accepted = false;
+        const llama_token tok = common_sampler_spec_step(gsmpl->cur_p, draft_q[i], draft[i], rng, accepted, stats);
+
+        common_sampler_accept(gsmpl, tok, true);
+        result.push_back(tok);
+
+        if (!accepted) {
+            return result;
+        }
+    }
+
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()]);
+
+    common_sampler_accept(gsmpl, id, true);
+
+    result.push_back(id);
+
+    return result;
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }

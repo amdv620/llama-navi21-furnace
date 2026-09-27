@@ -328,6 +328,8 @@ struct common_params_speculative_draft {
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+    float temp    = 0.0f; // sample drafts from the drafter's distribution at this temperature and verify them
+                          // with speculative sampling when the request samples (0 = greedy drafts, exact match)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
