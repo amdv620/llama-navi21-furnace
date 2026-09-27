@@ -512,3 +512,39 @@ Per verified position, MTP: sum min(p,q) 0.66 vs p(argmax q) 0.57. Greedy output
 on is identical; with tools attached no position falls back to exact match. With both
 drafters sampling, MTP n=3 leads on research chat by ~4% and DFlash2 leads on the mixed prompts
 by ~7% (math most of all).
+
+## 14. 2026-09-27: flash-attention occupancy on RDNA2, D=256 retune (b96c5233d)
+
+HIP reports 32768 registers per multiprocessor on gfx1030, a quarter of a WGP's register file,
+so its occupancy query returned 0 for flash-attention tile kernels above 128 VGPRs (every larger
+tile config aborted) and too few blocks for the rest (the small-batch kernels split the KV cache
+too coarsely). launch_fattn now computes RDNA2 occupancy from the kernel's registers and LDS, and
+the D=256 tile uses 64-key batches.
+
+Per attention call, Qwen3.5 shape (24 Q heads over 4 KV heads, D=256):
+
+| | before | after |
+|---|---|---|
+| prefill, 512 tokens | 12.0 TFLOPS | 15.7 TFLOPS |
+| decode, 1 token, 64k context | 1200 us | 580 us |
+| verify, 4 tokens, 64k | 1766 us | 678 us |
+| verify, 8 tokens, 64k | 2190 us | 1162 us |
+
+Swift-Qwen3.8-27B Q4_K_XL at 64k context (llama-bench): pp512 216.7 -> 245.8, tg32 16.5 -> 19.8.
+Empty context unchanged (pp512 425). Web UI server, DFlash, one long document at growing depth:
+
+| depth | prompt t/s before -> after | generation t/s before -> after |
+|---|---|---|
+| 16k | 366 -> 369 | 45.2 -> 49.3 |
+| 32k | 304 -> 323 | 41.7 -> 45.5 |
+| 64k | 243 -> 269 | 32.0 -> 37.0 |
+| 96k | 191 -> 219 | 29.6 -> 41.9 (acceptance 55% -> 61%) |
+| 128k | 158 -> 185 | 25.6 -> 38.4 (acceptance 56% -> 63%) |
+
+Prompt speed is the newest 32k chunk. The 96k/128k generation gains are partly higher draft
+acceptance in those runs; the controlled figure is the llama-bench one above.
+Flash-attention tests pass for D=64/128/256/512/576; KLD against the flash-attention-off path
+improved (mean 0.0063 -> 0.0056, max 1.47 -> 0.28). The server now runs 128k context.
+
+Tried and rejected on the way: forced rocBLAS matmuls for prefill (371-378 vs 434 t/s), flash
+attention off (slower at depth), ubatch 1024/2048 (no change), a 64-column tile for D=256 (slower).
