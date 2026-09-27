@@ -548,3 +548,18 @@ improved (mean 0.0063 -> 0.0056, max 1.47 -> 0.28). The server now runs 128k con
 
 Tried and rejected on the way: forced rocBLAS matmuls for prefill (371-378 vs 434 t/s), flash
 attention off (slower at depth), ubatch 1024/2048 (no change), a 64-column tile for D=256 (slower).
+
+## 15. 2026-09-27: follow-ups from an outside review
+
+A read-only review of this work proposed ranked ideas; four were tried.
+
+| idea | result |
+|---|---|
+| A. Run the 8 conv-state snapshot copies per delta-net layer (384 kernels per verify step at draft cap 7) as one launch (7de0c83d2) | +1.4% spec decode (59.3 -> 60.1 t/s, 4 prompts x 2 rounds, every prompt faster). Greedy output byte-identical; a mutant that writes the wrong slots changes it. |
+| B1. Verify-batch attention configs: the 3-4 token entry compiled to 256 VGPRs with spills (abef34ca5) | 118 VGPRs, no spills; 8-token verify at 64k 1161 -> 1062 us per call, 4-token 679 -> 662 us. |
+| B2. All 6 query heads of a KV head in one block (ncols2 = 6) | Correct, but every variant spills 23-333 VGPRs to scratch: prefill attention 15.5 -> 3.0 TFLOPS. The tile kernel does not handle a non-power-of-two group size efficiently; would need kernel rework. Not committed. |
+| E. Truncate the drafter's distribution with the request's top-p before sampling | Scored on the same 7000 positions: expected acceptance 0.6654 -> 0.6687 at top-p 0.95 (worse at 0.8). About +0.5%; not implemented. |
+| C. MMQ stream-k with more persistent blocks | The old stream-k test was starved (36 blocks, 1 per WGP): 302 t/s at 1x, 415.5 at 2x, but tiling is still faster (428.9). Closed. |
+
+Also found: at temperature 1.0 the same request with the same seed does not give the same text
+from run to run, even on an unchanged build (greedy does). Output comparisons must use greedy.
