@@ -3632,6 +3632,64 @@ static int ggml_cuda_find_add_softplus_mul(const ggml_cgraph * cgraph, int i) {
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// A run of CPY nodes (views/no-ops in between) that read same-shaped views of one tensor and write
+// same-shaped, non-overlapping views of another, e.g. the K conv-state snapshots a delta-net layer
+// writes to consecutive cache slots when speculative decoding needs rollback. Runs them as one
+// launch. Returns the number of nodes to skip after node i, or 0.
+static int ggml_cuda_try_cpy_multi_fusion(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, const int i) {
+    const ggml_tensor * first = cgraph->nodes[i];
+    const ggml_tensor * a0    = first->src[0];
+    const ggml_tensor * b0    = first->src[1];
+    if (a0->type != GGML_TYPE_F32 || b0->type != GGML_TYPE_F32 || ggml_is_contiguous(a0) ||
+            a0->view_src == nullptr || b0->view_src == nullptr ||
+            a0->view_src == b0->view_src || (first->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * srcs[GGML_CUDA_CPY_MULTI_MAX] = { a0 };
+    ggml_tensor       * dsts[GGML_CUDA_CPY_MULTI_MAX] = { first->src[1] };
+    int n    = 1;
+    int last = i;
+
+    for (int j = i + 1; j < cgraph->n_nodes && n < GGML_CUDA_CPY_MULTI_MAX; ++j) {
+        const ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node)) {
+            continue;
+        }
+        if (node->op != GGML_OP_CPY || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            break;
+        }
+        const ggml_tensor * a = node->src[0];
+        const ggml_tensor * b = node->src[1];
+        if (a->type != a0->type || b->type != b0->type || a->view_src != a0->view_src || b->view_src != b0->view_src ||
+                !ggml_are_same_shape(a, a0) || !ggml_are_same_stride(a, a0) ||
+                !ggml_are_same_shape(b, b0) || !ggml_are_same_stride(b, b0)) {
+            break;
+        }
+        srcs[n] = a;
+        dsts[n] = node->src[1];
+        n++;
+        last = j;
+    }
+    if (n < 2) {
+        return 0;
+    }
+
+    // the copies must not write over each other: order would matter
+    for (int x = 0; x < n; ++x) {
+        const char * bx = (const char *) dsts[x]->data;
+        for (int y = x + 1; y < n; ++y) {
+            const char * by = (const char *) dsts[y]->data;
+            if (bx < by + ggml_nbytes(dsts[y]) && by < bx + ggml_nbytes(dsts[x])) {
+                return 0;
+            }
+        }
+    }
+
+    ggml_cuda_cpy_f32_multi(*cuda_ctx, srcs, dsts, n);
+    return last - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3649,6 +3707,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
+            }
+        }
+    }
+
+    // runs of same-shaped snapshot copies into the recurrent cache
+    if (node->op == GGML_OP_CPY) {
+        static const bool cpy_multi_off = getenv("GGML_CUDA_NO_CPY_MULTI_FUSION") != nullptr;
+        if (!cpy_multi_off) {
+            const int nodes_to_skip = ggml_cuda_try_cpy_multi_fusion(cuda_ctx, cgraph, i);
+            if (nodes_to_skip > 0) {
+                return nodes_to_skip;
             }
         }
     }
