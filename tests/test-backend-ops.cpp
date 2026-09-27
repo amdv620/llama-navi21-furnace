@@ -3730,6 +3730,54 @@ struct test_rms_norm_back : public test_case {
 };
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_ADD (+ GGML_OP_MUL)
+// GGML_OP_RMS_NORM followed by GGML_OP_SCALE: the L2 norm of gated delta-net q/k
+// (scale(rms_norm(x, eps/n), 1/sqrt(n))), which backends may fuse into one kernel
+struct test_rms_norm_scale : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+    const float scale;
+    const float bias;
+    const bool  strided; // normalize a strided view, like the q/k heads taken out of the conv output
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "RMS_NORM_SCALE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR5(ne, eps, scale, bias, strided);
+    }
+
+    test_rms_norm_scale(std::array<int64_t, 4> ne = {128, 16, 4, 1}, float eps = 1e-6f,
+            float scale = 0.088388f, float bias = 0.0f, bool strided = false)
+        : ne(ne), eps(eps), scale(scale), bias(bias), strided(strided) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        std::array<int64_t, 4> ne_a = ne;
+        if (strided) {
+            ne_a[1] *= 3;
+        }
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne_a.data());
+        ggml_set_param(a);
+        ggml_set_name(a, "a");
+        ggml_set_param(b);
+        ggml_set_name(b, "b");
+
+        // compute the input so the norm is not the first node
+        ggml_tensor * x = ggml_add(ctx, a, b);
+        if (strided) {
+            x = ggml_view_4d(ctx, x, ne[0], ne[1], ne[2], ne[3], x->nb[1], x->nb[2], x->nb[3], ne[1]*x->nb[1]);
+        }
+        ggml_tensor * out = ggml_scale_bias(ctx, ggml_rms_norm(ctx, x, eps), scale, bias);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_rms_norm_mul_add : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -9747,6 +9795,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F16, GGML_TYPE_F32, { n, 5, 4, 3 }, true, false));
     }
 
+    for (bool strided : { false, true }) {
+        for (float bias : { 0.0f, 0.5f }) {
+            test_cases.emplace_back(new test_rms_norm_scale({ 128, 16, 1, 1 }, 1e-6f/128, 0.088388f, bias, strided));
+            test_cases.emplace_back(new test_rms_norm_scale({ 128, 16, 4, 2 }, 1e-6f/128, 0.088388f, bias, strided));
+            test_cases.emplace_back(new test_rms_norm_scale({ 1025, 5, 4, 3 }, 1e-4f, 2.5f, bias, strided));
+        }
+    }
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 3, 2 }, 1e-6f, false, false, true));

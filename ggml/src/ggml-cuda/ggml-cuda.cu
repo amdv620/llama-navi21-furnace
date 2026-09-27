@@ -3432,6 +3432,29 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // rms_norm followed by a constant scale (e.g. the q/k L2 norm of gated delta-net layers,
+    // built as scale(rms_norm(x, eps/n), 1/sqrt(n))): the factor is applied inside the norm kernel
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_SCALE) {
+        const ggml_tensor * rms_norm = cgraph->nodes[node_idx];
+        const ggml_tensor * scale    = cgraph->nodes[node_idx+1];
+
+        if (rms_norm->src[0]->type != GGML_TYPE_F32 || rms_norm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) {
+            return false;
+        }
+
+        // the norm kernel has no bias term
+        if (ggml_get_op_params_f32(scale, 1) != 0.0f) {
+            return false;
+        }
+
+        // the norm kernel writes its rows contiguously
+        if (!ggml_is_contiguous(scale)) {
+            return false;
+        }
+
+        return true;
+    }
+
     return false;
 }
 
@@ -4156,6 +4179,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        ggml_cuda_op_rms_norm_scale(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }
 
