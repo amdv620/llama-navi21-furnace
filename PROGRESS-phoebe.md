@@ -461,3 +461,30 @@ Commit 5f0437f39, warm llama-server, mean of four prompts.
   Outside GPU waits the main thread's work is spread over many functions at <0.5% each.
   The drafter context never reuses its graph (it alternates the injection and draft graphs),
   but that shows as ~0.1% of CPU samples. No single fixable cause.
+
+## 13. 2026-09-27: speculative sampling for temperature 1.0 chat
+
+With exact-match verification, a draft token survives only when the target's own random sample
+equals it, so at temperature 1.0 the acceptance of a draft is p(draft). Commit 2055e58f9 adds
+standard speculative sampling for DFlash2 (`--spec-draft-temp T`, server only, default off):
+each draft position is sampled from softmax(selector scores / T) over its 16 candidates, and
+verification accepts with probability min(1, p/q), otherwise emits a sample of
+norm(max(0, p - q)) and stops. The output distribution is exactly the target's. Greedy
+requests keep argmax drafts; grammar-constrained positions fall back to exact match.
+
+Chat benchmark (Swift Q4_K_XL, the web UI system prompt, 4 research questions x 3 seeds,
+temp 1.0 / top-p 0.95 / top-k 20, 700 tokens), interleaved:
+
+| drafts | t/s | draft accepted |
+|---|---|---|
+| argmax (before) | 37.4, 37.4, 37.4 | 43% |
+| sampled, T = 1.0 | 42.3, 42.6, 42.7, 43.5 | 49% |
+
+Per verified position, sum min(p, q) = 0.67 against p(argmax q) = 0.58. Scored on the same
+positions, drafter temperatures 0.85-1.0 are the flat optimum (0.4: 0.64, 1.3: 0.66), so the
+drafter is well calibrated and T = 1.0 is used.
+
+Checks: the accept/residual step against synthetic p and q (1M-4M trials, output frequencies
+match p); 3000 short completions plain vs speculative, tokens 2-4 not distinguishable
+(chi-square p 0.54-0.94); greedy text and PPL identical to the previous build. Both launchers
+now pass `--spec-draft-temp 1.0`. MTP still drafts greedily and is the next candidate.
