@@ -1569,6 +1569,15 @@ struct ggml_backend_cuda_context {
     ggml_cuda_stream_context concurrent_stream_context;
     ggml_cuda_q8_1_cache     q8_1_cache;   // cleared at the start of every graph evaluation
 
+    // GATED_DELTA_NET nodes whose input-state gather (GET_ROWS from the recurrent cache) was
+    // skipped: the kernel reads the rows through the ids instead. Per graph evaluation.
+    struct gdn_state_gather_t {
+        const float *   src;        // the cache (GET_ROWS src0)
+        const int32_t * ids;        // row ids (GET_ROWS src1), one per sequence
+        int64_t         row_stride; // in floats
+    };
+    std::unordered_map<const ggml_tensor *, gdn_state_gather_t> gdn_state_gather;
+
     ~ggml_backend_cuda_context();
 
     cudaStream_t stream(int device, int stream) {

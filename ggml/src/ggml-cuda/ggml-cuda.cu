@@ -2766,6 +2766,59 @@ static bool ggml_cuda_should_fuse_rms_norm_mul_rope(const ggml_tensor * rms_norm
     return true;
 }
 
+static int32_t ggml_cuda_tensor_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (!ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// A recurrent model gathers each sequence's state out of the cache (GET_ROWS, see build_rs)
+// into a contiguous tensor that only the GATED_DELTA_NET reads - a full copy of a 3 MB state per
+// delta-net layer and token for Qwen3.5-27B. If that is the gather's only use, skip it and let
+// the kernel read the rows through the ids. Only for a single sequence: the gather is what
+// keeps one sequence's source row from being overwritten by another sequence's output within
+// the same kernel; for one sequence each thread reads its state elements before it writes them.
+static bool ggml_cuda_try_gdn_state_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * gather = cgraph->nodes[node_idx];
+    if (gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 ||
+            gather->src[0]->type != GGML_TYPE_F32 || gather->src[1]->type != GGML_TYPE_I32 ||
+            gather->ne[1] != 1 || gather->ne[2] != 1 || gather->ne[3] != 1 ||
+            gather->src[0]->nb[0] != sizeof(float) || gather->src[1]->ne[0] != 1 ||
+            (gather->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_cuda_tensor_use_count(cgraph, gather) != 1) {
+        return false;
+    }
+
+    // the consumer is a few nodes later in the same layer
+    const int end = std::min(cgraph->n_nodes, node_idx + 128);
+    for (int j = node_idx + 1; j < end; ++j) {
+        const ggml_tensor * gdn = cgraph->nodes[j];
+        if (gdn->op != GGML_OP_GATED_DELTA_NET) {
+            continue;
+        }
+        // walk the state input back through single-use reshapes to the gather
+        const ggml_tensor * t = gdn->src[5];
+        while (t != gather && t != nullptr && t->op == GGML_OP_RESHAPE &&
+                ggml_cuda_tensor_use_count(cgraph, t) == 1 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            t = t->src[0];
+        }
+        if (t != gather) {
+            continue;
+        }
+        if (gdn->src[5]->ne[3] != 1 || ggml_nelements(gdn->src[5]) != gather->ne[0]) {
+            return false;
+        }
+        cuda_ctx->gdn_state_gather[gdn] = {
+            (const float *)   gather->src[0]->data,
+            (const int32_t *) gather->src[1]->data,
+            (int64_t) (gather->src[0]->nb[1] / sizeof(float)),
+        };
+        return true;
+    }
+    return false;
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 static int ggml_cuda_try_gdn_cache_fusion(
@@ -4367,6 +4420,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                static const bool gdn_gather_off = getenv("GGML_CUDA_NO_GDN_GATHER_FUSION") != nullptr;
+                if (!gdn_gather_off && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cuda_ctx, cgraph, i)) {
+                    continue; // read by the GATED_DELTA_NET directly
+                }
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4469,6 +4527,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     // q8_1 buffers are only reusable within one graph evaluation
     cuda_ctx->q8_1_cache.clear();
+    cuda_ctx->gdn_state_gather.clear();
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

@@ -4750,6 +4750,80 @@ struct test_gated_delta_net : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET + GGML_OP_CPY (recurrent cache fusion)
+// GATED_DELTA_NET whose input state is gathered from a larger recurrent-state cache
+// (get_rows -> reshape), as llama.cpp's build_rs does. Backends may skip the gather and let
+// the kernel read the rows through the ids (single-sequence batches).
+struct test_gated_delta_net_state_gather : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t n_rows; // rows in the state cache
+    const int64_t K;
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_seqs, n_rows, K);
+    }
+
+    test_gated_delta_net_state_gather(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 1,
+            int64_t n_seqs = 1, int64_t n_rows = 4, int64_t K = 1)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), n_rows(n_rows), K(K) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_STATE_GATHER";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S_v = head_size;
+        const int64_t H   = head_count;
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_seq_tokens, n_seqs);
+        ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_seq_tokens, n_seqs);
+        ggml_tensor * v    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H, n_seq_tokens, n_seqs);
+        ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,   H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1,   H, n_seq_tokens, n_seqs);
+        ggml_tensor * all  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S_v * S_v * H, n_rows);
+        ggml_tensor * ids  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        ggml_set_name(all, "state_cache");
+        ggml_set_name(ids, "ids");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * state = ggml_reshape_4d(ctx, ggml_get_rows(ctx, all, ids), S_v, S_v, H, n_seqs);
+        ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                // distinct rows, not in order
+                std::vector<int32_t> rows(n_rows);
+                std::iota(rows.begin(), rows.end(), 0);
+                std::shuffle(rows.begin(), rows.end(), rng);
+                ggml_backend_tensor_set(t, rows.data(), 0, n_seqs * sizeof(int32_t));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_gated_delta_net_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -11050,6 +11124,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
     // gdn + cache cpy fusion (K > 1)
+    for (int64_t K : { 1, 2 }) {
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(4,  32, 1, 1, 4, K));
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(4,  32, 3, 1, 4, K));
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(16, 128, 1, 1, 3, K));
+        test_cases.emplace_back(new test_gated_delta_net_state_gather(4,  32, 1, 2, 4, K)); // two sequences: not fused
+    }
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   2, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 64,   4, 1, 2));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
