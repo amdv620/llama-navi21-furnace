@@ -373,16 +373,18 @@ Mean over four prompts (math, code, list, essay), 256 tokens, greedy unless note
 
 ### Results
 
-| model | mode | t/s |
-|---|---|---|
-| Qwen3.8-27B UD-Q4_K_XL | plain decode | 24.0 |
-| | MTP n=3, stock drafter | 49.6 |
-| | MTP n=3, reduced-vocab drafter | 51.7 |
-| | **DFlash2, adaptive cap 7, reduced-vocab drafter** | **61.1** |
-| Swift-Qwen3.8-27B, our Q4_K_XL | plain decode | 23.9 |
-| | MTP n=3, reduced-vocab drafter | 52.2 |
-| | **DFlash2 n=3, reduced-vocab drafter** | **53.8** |
-| | same, temp 1.0 / top-p 0.95 / top-k 20 (model card) | 51.8 |
+| model | mode | start of night | final |
+|---|---|---|---|
+| Qwen3.8-27B UD-Q4_K_XL | plain decode | 23.8 | 24.5 |
+| | MTP n=3 (reduced-vocab drafter) | 49.6 | **54.2** |
+| | **DFlash2, adaptive cap 7 (reduced-vocab drafter)** | 58.0 | **61.1** |
+| Swift-Qwen3.8-27B | plain decode | 23.4 (their Q4_K_M) | 24.4 (our Q4_K_XL) |
+| | MTP n=3 (reduced-vocab drafter) | 48.6 | 52.6 |
+| | **DFlash2 n=3 (reduced-vocab drafter)** | 51.4 | **54.3** |
+| | same, temp 1.0 / top-p 0.95 / top-k 20 (model card) | | 52.0 |
+
+Final numbers are on commit 0b1887762. At ~8k tokens of context Swift + DFlash2 still runs at
+45.9 t/s (plain 22.6).
 
 ### What landed
 
@@ -394,8 +396,11 @@ Mean over four prompts (math, code, list, essay), 256 tokens, greedy unless note
   +2.9% DFlash, +8.5% MTP (vs the stock drafter).
 - **CUDA graph cache keyed by shape.** Batch sizes that differ only in token count shared one
   cache entry, so adaptive draft lengths kept evicting it: captures 226 -> 87 per session, +1.5%.
-- **RMS_NORM+SCALE fusion** (delta-net q/k L2 norm) and the `ssm_out` residual fusion:
-  1800 -> 1665 dispatches per token, decode 23.90 -> 24.10.
+- **Fewer kernels per delta-net layer**: RMS_NORM+SCALE fusion (q/k L2 norm), the `ssm_out`
+  and alpha-gate bias adds moved so they fuse into their matmuls, the batch-1 conv-input copy
+  replaced by a reshape, and GATED_DELTA_NET reading its state straight from the cache instead
+  of a gathered 3 MB copy (single-sequence batches). 1800 -> ~1520 dispatches per token,
+  decode 23.90 -> 24.67; the 4-token verify 82.1 -> 83.2.
 - **Flash-attn tile fixes scoped to RDNA2.** RDNA3/4 also use the tile kernel for decode and
   small batches; the shared table is upstream's again.
 
