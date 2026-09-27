@@ -494,3 +494,21 @@ now pass `--spec-draft-temp 1.0`; greedy requests to such a server give byte-ide
 With tools attached: 198 and 121 positions verified by p/q, none by exact match, tool call parsed.
 Not exercised: the checkpoint-replay branch (needs a rollback beyond n_rs_seq = n_max, which
 cannot happen here). MTP still drafts greedily and is the next candidate.
+
+### 13a. The same for MTP (529c6fb90)
+
+The MTP drafter samples each step from softmax(logits / T) over its top-10 candidates and feeds
+the sampled token to the next step. Swift Q4_K_XL, MTP head with the 64k reduced vocabulary,
+all at temp 1.0, interleaved:
+
+| config | chat bench (t/s) | math / code / list / essay (t/s, mean of 2) | mean |
+|---|---|---|---|
+| MTP n=3, argmax drafts | 38.0, 37.9 (37% accepted) | | |
+| MTP n=3, sampled | 44.2, 44.2 (48% accepted) | 62.1 / 54.1 / 64.3 / 42.7 | 55.8 |
+| MTP n=4, sampled | | 64.5 / 56.0 / 70.9 / 38.4 | 57.4 |
+| DFlash2 adaptive cap 7, sampled | 41.8, 42.9 (48-49% accepted) | 76.1 / 54.1 / 68.6 / 39.7 | 59.6 |
+
+Per verified position, MTP: sum min(p,q) 0.66 vs p(argmax q) 0.57. Greedy output with the flag
+on is identical; with tools attached no position falls back to exact match. With both
+drafters sampling, MTP n=3 leads on research chat by ~4% and DFlash2 leads on the mixed prompts
+by ~7% (math most of all).
