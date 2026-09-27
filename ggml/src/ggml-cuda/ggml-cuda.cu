@@ -3521,6 +3521,61 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// ADD -> RMS_NORM -> MUL(weight): a residual add followed by the next pre-norm. The generic
+// ggml_can_fuse does not apply because the sum has a second consumer (it is also the next
+// residual); the fused kernel writes it, so only the norm output has to be single-use.
+static bool ggml_cuda_can_fuse_add_rms_norm_mul(const ggml_cgraph * cgraph, int i) {
+    if (i + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * add  = cgraph->nodes[i];
+    const ggml_tensor * norm = cgraph->nodes[i + 1];
+    const ggml_tensor * mul  = cgraph->nodes[i + 2];
+    if (add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || norm->src[0] != add) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[0] == norm ? mul->src[1] : (mul->src[1] == norm ? mul->src[0] : nullptr);
+    if (w == nullptr) {
+        return false;
+    }
+    if (ggml_cuda_tensor_use_count(cgraph, norm) != 1 || (norm->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    for (const ggml_tensor * t : std::initializer_list<const ggml_tensor *>{ add->src[0], add->src[1], add, norm, mul, w }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    // no broadcast in the add; the weight is one row shared by all rows
+    if (!ggml_are_same_shape(add->src[0], add->src[1]) || !ggml_are_same_shape(add, mul) ||
+            w->ne[0] != add->ne[0] || ggml_nrows(w) != 1) {
+        return false;
+    }
+    // The allocator routinely places the sum over a dying input and the result over the other
+    // (a residual add consumes both). Exact aliasing among a, b, sum and dst is safe in the fused
+    // kernel: every thread reads a[c], b[c] before writing sum[c] at the same index, columns are
+    // disjoint across threads, the block reduction orders all reads of the first loop before any
+    // write of the second, and each row belongs to one block. Partial overlaps are not safe, and
+    // the weight is shared by all rows, so it must not be touched at all.
+    auto overlap = [](const ggml_tensor * x, const ggml_tensor * y) {
+        const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
+        const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
+        return x0 < y1 && y0 < x1;
+    };
+    const ggml_tensor * ins[] = { add->src[0], add->src[1] };
+    for (const ggml_tensor * out : { (const ggml_tensor *) add, (const ggml_tensor *) mul }) {
+        if (overlap(out, w)) {
+            return false;
+        }
+        for (const ggml_tensor * in : ins) {
+            if (overlap(out, in) && out->data != in->data) {
+                return false;
+            }
+        }
+    }
+    return !overlap(add, mul) || add->data == mul->data;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4232,6 +4287,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
+        return 2;
+    }
+
+    if (ggml_cuda_can_fuse_add_rms_norm_mul(cgraph, i)) {
+        ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
     }
 

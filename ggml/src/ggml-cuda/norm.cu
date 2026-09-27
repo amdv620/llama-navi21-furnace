@@ -303,6 +303,40 @@ static void group_norm_f32_cuda(
     }
 }
 
+// ADD -> RMS_NORM -> MUL(weight) in one pass: the residual add of a transformer block followed
+// by the next pre-norm. Writes the sum (it is also the next residual) and the normalized,
+// weighted result. Same loop structure and reduction as rms_norm_f32, so the output is
+// bit-identical to the three separate kernels.
+template <int block_size>
+static __global__ void add_rms_norm_mul_f32(const float * a, const float * b, float * sum,
+                                            const float * mul, float * dst, const int ncols, const float eps) {
+    const int64_t row = blockIdx.x;
+    const int     tid = threadIdx.x;
+
+    a   += row*ncols;
+    b   += row*ncols;
+    sum += row*ncols;
+    dst += row*ncols;
+
+    float tmp = 0.0f;
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = a[col] + b[col];
+        sum[col] = xi;
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    // each thread reads back only the sums it wrote itself
+    for (int col = tid; col < ncols; col += block_size) {
+        dst[col] = scale * sum[col] * mul[col];
+    }
+}
+
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
@@ -713,4 +747,28 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s03 = nb03 / ts0;
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+}
+
+void ggml_cuda_op_add_rms_norm_mul(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * rms_norm, ggml_tensor * mul) {
+    const ggml_tensor * w = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    float eps;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+
+    const int     ncols = add->ne[0];
+    const int64_t nrows = ggml_nrows(add);
+    cudaStream_t stream = ctx.stream();
+
+    const float * a_d   = (const float *) add->src[0]->data;
+    const float * b_d   = (const float *) add->src[1]->data;
+    float *       sum_d = (float *) add->data;
+    const float * w_d   = (const float *) w->data;
+    float *       dst_d = (float *) mul->data;
+
+    if (ncols < 1024) {
+        add_rms_norm_mul_f32<256><<<nrows, 256, 32 * sizeof(float), stream>>>(a_d, b_d, sum_d, w_d, dst_d, ncols, eps);
+    } else {
+        add_rms_norm_mul_f32<1024><<<nrows, 1024, 32 * sizeof(float), stream>>>(a_d, b_d, sum_d, w_d, dst_d, ncols, eps);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
