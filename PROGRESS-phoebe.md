@@ -435,3 +435,29 @@ Qwopus, DFlash2 transfers to it.
 A DFlash n=3 iteration on Swift is ~56 ms: ~49 ms target verify of 4 tokens, 4.4 ms drafter,
 ~2-3 ms host. The verify runs at 88-93% of memory bandwidth; what remains is small kernels
 (each <1%) or fewer bytes (a quality trade).
+
+## 12. 2026-09-27 follow-up: the three remaining items
+
+| model | mode | before | after |
+|---|---|---|---|
+| Qwen3.8-27B | DFlash2 adaptive cap 7 | 61.1 | **62.2** |
+| | MTP n=3 | 54.2 | **55.0** |
+| Swift-Qwen3.8-27B (our Q4_K_XL) | DFlash2, greedy | 54.3 (fixed n=3) | **58.5** (adaptive cap 7) |
+| | DFlash2, temp 1.0 | 52.0 | **52.9** |
+
+Commit 5f0437f39, warm llama-server, mean of four prompts.
+
+- **Kernel merges in the verify batch (landed).** ADD->RMS_NORM->MUL (the residual add and the
+  next pre-norm, writing both outputs; the allocator aliases the sum over one input and the
+  result over the other, which the kernel handles) and ADD->SOFTPLUS->MUL with row-broadcast
+  vectors (delta-net decay gate). The 4-token eval runs no binary-op kernels any more
+  (224 -> 0), 2026 -> 1802 dispatches, pp4 83.3 -> 84.9.
+- **Draft-length control (no new code needed).** Re-measured on the deployed setup, the
+  existing adaptive controller now matches the best fixed length on every prompt for Swift
+  too: the reduced-vocab drafter made longer drafts cheap. Launcher switched from fixed n=3 to
+  cap 7.
+- **Host gap between steps (stopped).** Per iteration: target submit 0.65 ms, drafter submit
+  0.6, feature hand-off 0.2 (copy 0.02), sampling 0.5-0.7; the drafter's GPU time is ~4 ms.
+  Outside GPU waits the main thread's work is spread over many functions at <0.5% each.
+  The drafter context never reuses its graph (it alternates the injection and draft graphs),
+  but that shows as ~0.1% of CPU samples. No single fixable cause.
