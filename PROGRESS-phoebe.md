@@ -360,3 +360,73 @@ adds capsule protection so rollback may be blocked, and flashing resets all sett
 Kill switches: `GGML_CUDA_NO_Q8_1_CACHE=1`, `LLAMA_SPEC_NO_ADAPTIVE=1`,
 `GGML_CUDA_DISABLE_GRAPHS=1` (also required for `rocprofv3 --kernel-trace` on the decode
 path, which segfaults otherwise).
+
+---
+
+## 11. 2026-09-27 overnight: single-V620 speculative decoding push
+
+Goal: the best experience on **one** V620, since that is what most people running this will
+have. All numbers below are from a **warm llama-server** (every prompt run once untimed
+first): a fresh process pays one-time costs on its first request (lazy kernel loading, first
+CUDA-graph captures), e.g. DFlash math 68.5 t/s cold vs 79.3 warm with identical tokens.
+Mean over four prompts (math, code, list, essay), 256 tokens, greedy unless noted.
+
+### Results
+
+| model | mode | t/s |
+|---|---|---|
+| Qwen3.8-27B UD-Q4_K_XL | plain decode | 24.0 |
+| | MTP n=3, stock drafter | 49.6 |
+| | MTP n=3, reduced-vocab drafter | 51.7 |
+| | **DFlash2, adaptive cap 7, reduced-vocab drafter** | **61.1** |
+| Swift-Qwen3.8-27B, our Q4_K_XL | plain decode | 23.9 |
+| | MTP n=3, reduced-vocab drafter | 52.2 |
+| | **DFlash2 n=3, reduced-vocab drafter** | **53.8** |
+| | same, temp 1.0 / top-p 0.95 / top-k 20 (model card) | 51.8 |
+
+### What landed
+
+- **Reduced draft vocabulary** (`scripts/draft-vocab/build-draft-vocab.py`, MTP support in
+  `qwen35.cpp`). The drafter's LM head was half its cost (3.0 of 6.2 ms per DFlash iteration;
+  MTP runs it every draft step). The script copies the 64k most likely tokens' rows of the
+  *target's own* output projection as raw quantized bytes, plus a `d2t` map; logits for kept
+  tokens are bit-identical and output is unchanged. 98.9% coverage of held-out model output.
+  +2.9% DFlash, +8.5% MTP (vs the stock drafter).
+- **CUDA graph cache keyed by shape.** Batch sizes that differ only in token count shared one
+  cache entry, so adaptive draft lengths kept evicting it: captures 226 -> 87 per session, +1.5%.
+- **RMS_NORM+SCALE fusion** (delta-net q/k L2 norm) and the `ssm_out` residual fusion:
+  1800 -> 1665 dispatches per token, decode 23.90 -> 24.10.
+- **Flash-attn tile fixes scoped to RDNA2.** RDNA3/4 also use the tile kernel for decode and
+  small batches; the shared table is upstream's again.
+
+### Swift-Qwen3.8-27B quantization
+
+Our build from Swift's F16: Unsloth's UD-Q4_K_XL per-tensor recipe with the IQ tensors moved to
+Q4_K, Unsloth's imatrix (computed on the base model). KL divergence vs Swift's Q8_0, wikitext,
+512 ctx, 95 chunks:
+
+| | size | mean KLD | 99% KLD | same top token |
+|---|---|---|---|---|
+| Swift's own Q4_K_M | 16.79 GiB | 0.0134 | 0.144 | 95.27% |
+| our Q4_K_XL (no IQ) | 16.57 GiB | **0.0092** | **0.093** | **96.41%** |
+
+Swift's MTP head is the stock head (all F32 norms bit-identical to the base model), and unlike
+Qwopus, DFlash2 transfers to it.
+
+### Tried and rejected
+
+- **MMVQ fusion for 2-8 columns** (residual add, gate+up GLU in the verify batch): the fused
+  kernel variant is 5x slower at 8 columns (pp8 119 -> 23 t/s), even with only a bias.
+- **Measured-throughput draft-length controller** (per-length moving averages of tokens/ms,
+  periodic neighbour probes): worse than the existing one. A length's first use includes graph
+  capture (up to 195 ms), which poisons its estimate; iteration cost is nearly flat for n=1..3
+  so the choice rides on noisy, content-dependent token counts.
+- Graphs off, fewer CPU threads, GPU-side target sampling: all within 1%.
+- DFlash2's block width changes the accuracy of *every* drafted position (Swift code:
+  first-token acceptance 0.92 at n=3, 0.84 at n=4), which is why n=3 often beats wider drafts.
+
+### Where the time goes now
+
+A DFlash n=3 iteration on Swift is ~56 ms: ~49 ms target verify of 4 tokens, 4.4 ms drafter,
+~2-3 ms host. The verify runs at 88-93% of memory bandwidth; what remains is small kernels
+(each <1%) or fewer bytes (a quality trade).
