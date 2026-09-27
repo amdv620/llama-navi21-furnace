@@ -690,8 +690,9 @@ struct server_slot {
 
         if (spec_stats.n_pos > 0) {
             SLT_INF(*this,
-                    "spec sampling: %lld positions, mean sum min(p,q) = %.4f, mean p(argmax q) = %.4f\n",
-                    (long long) spec_stats.n_pos, spec_stats.sum_min / spec_stats.n_pos, spec_stats.sum_greedy / spec_stats.n_pos);
+                    "spec sampling: %lld positions (%lld exact match), mean sum min(p,q) = %.4f, mean p(argmax q) = %.4f\n",
+                    (long long) spec_stats.n_pos, (long long) spec_stats.n_exact,
+                    spec_stats.sum_min / spec_stats.n_pos, spec_stats.sum_greedy / spec_stats.n_pos);
         }
 
         common_speculative_print_stats(spec);

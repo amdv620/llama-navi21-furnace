@@ -819,7 +819,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_spec(struct common_s
     result.reserve(idxs.size());
 
     for (size_t i = 0; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i]);
+        // grammar first: cur_p is then exactly the distribution id is drawn from, with p = 0 for
+        // tokens the grammar rejects (an untriggered lazy grammar leaves it unchanged)
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], /* grammar_first */ true);
 
         if (is_replay) {
             common_sampler_accept(gsmpl, draft[i], true);
@@ -827,9 +829,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_spec(struct common_s
             continue;
         }
 
-        // with a grammar or a backend-selected token, cur_p is not the distribution id was drawn from:
+        // a backend sampler picked the token and cur_p is not the distribution it was drawn from:
         // verify by exact match, which is still exact for any draft
-        if (grammar_should_apply(gsmpl) || llama_get_sampled_token_ith(ctx, idxs[i]) != LLAMA_TOKEN_NULL) {
+        if (llama_get_sampled_token_ith(ctx, idxs[i]) != LLAMA_TOKEN_NULL) {
+            if (stats) {
+                stats->n_exact++;
+            }
             common_sampler_accept(gsmpl, id, true);
             result.push_back(id);
             if (draft[i] != id) {
@@ -849,7 +854,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_spec(struct common_s
         }
     }
 
-    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()]);
+    const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[draft.size()], /* grammar_first */ true);
 
     common_sampler_accept(gsmpl, id, true);
 

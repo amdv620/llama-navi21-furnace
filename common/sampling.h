@@ -94,6 +94,7 @@ struct common_sampler_spec_stats {
     int64_t n_pos      = 0; // positions verified against a draft distribution
     double  sum_min    = 0; // sum over positions of sum_t min(p_t, q_t): expected acceptance of the sampled draft
     double  sum_greedy = 0; // sum over positions of p(argmax q): expected acceptance of a greedy draft
+    int64_t n_exact    = 0; // positions verified by exact match instead (backend-sampled token)
 };
 
 // one step of speculative sampling (Leviathan et al. 2023, Chen et al. 2023)
@@ -102,12 +103,14 @@ struct common_sampler_spec_stats {
 // q the draft distribution the draft token x was sampled from (sparse, normalized .p).
 // accept x with probability min(1, p(x)/q(x)); otherwise return a sample of norm(max(0, p - q)).
 // the returned token is distributed exactly as p for any q.
+// cost is O(|q| * cur_p.size): small with the usual top-k, a full-vocabulary cur_p makes it slow.
 llama_token common_sampler_spec_step(const llama_token_data_array & cur_p, const std::vector<llama_token_data> & q,
         llama_token x, std::mt19937 & rng, bool & accepted, common_sampler_spec_stats * stats = nullptr);
 
 // like common_sampler_sample_and_accept_n, but each draft[i] was sampled from draft_q[i] and is verified
-// with common_sampler_spec_step instead of by exact match with the target's own sample. positions where
-// the grammar applies or a backend sampler picked the token fall back to exact match.
+// with common_sampler_spec_step instead of by exact match with the target's own sample. the target
+// distribution is taken with the grammar applied first, so a constrained position has p = 0 outside the
+// grammar. positions where a backend sampler picked the token fall back to exact match.
 // on replay (the draft was already accepted before a checkpoint restore) the draft is accepted as is.
 //
 // requires: idxs.size() == draft.size() + 1, draft_q.size() >= draft.size() unless is_replay

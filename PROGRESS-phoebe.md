@@ -470,7 +470,10 @@ standard speculative sampling for DFlash2 (`--spec-draft-temp T`, server only, d
 each draft position is sampled from softmax(selector scores / T) over its 16 candidates, and
 verification accepts with probability min(1, p/q), otherwise emits a sample of
 norm(max(0, p - q)) and stops. The output distribution is exactly the target's. Greedy
-requests keep argmax drafts; grammar-constrained positions fall back to exact match.
+requests keep argmax drafts. The target distribution is taken with the grammar applied first,
+so tool-call JSON (the web UI's MCP tools attach a lazy grammar) also goes through p/q
+verification; the first version fell back to exact match there, which disabled the feature for
+every answer once thinking ended.
 
 Chat benchmark (Swift Q4_K_XL, the web UI system prompt, 4 research questions x 3 seeds,
 temp 1.0 / top-p 0.95 / top-k 20, 700 tokens), interleaved:
@@ -487,4 +490,7 @@ drafter is well calibrated and T = 1.0 is used.
 Checks: the accept/residual step against synthetic p and q (1M-4M trials, output frequencies
 match p); 3000 short completions plain vs speculative, tokens 2-4 not distinguishable
 (chi-square p 0.54-0.94); greedy text and PPL identical to the previous build. Both launchers
-now pass `--spec-draft-temp 1.0`. MTP still drafts greedily and is the next candidate.
+now pass `--spec-draft-temp 1.0`; greedy requests to such a server give byte-identical output.
+With tools attached: 198 and 121 positions verified by p/q, none by exact match, tool call parsed.
+Not exercised: the checkpoint-replay branch (needs a rollback beyond n_rs_seq = n_max, which
+cannot happen here). MTP still drafts greedily and is the next candidate.
