@@ -466,7 +466,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
     cb(conv_states, "conv_states_reshaped", il);
 
-    qkv_mixed = ggml_cont(ctx0, ggml_transpose(ctx0, qkv_mixed));
+    // the concat below wants qkv_mixed contiguous; for a single token the transpose does not
+    // change the data layout, so a reshape is enough and avoids a copy
+    qkv_mixed = qkv_mixed->ne[1] == 1 && ggml_is_contiguous(qkv_mixed)
+        ? ggml_reshape_3d(ctx0, qkv_mixed, 1, qkv_mixed->ne[0], qkv_mixed->ne[2])
+        : ggml_cont(ctx0, ggml_transpose(ctx0, qkv_mixed));
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
