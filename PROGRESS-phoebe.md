@@ -657,3 +657,41 @@ combined in a different number of partial softmaxes. With the split pinned to th
 (9 blocks at 8 queries, 3 at 512) the new kernel's output is byte-identical to the old at kv 4096
 and 16384. The kernel arithmetic is exact; only the partition of the reduction moved, which it
 already does with context length and GPU.
+
+## 19. 2026-09-28: performance table after the attention change
+
+Swift-Qwen3.8-27B Q4_K_XL, one V620 at 300 W, build 5c913c0d2, 128k context, flash attention.
+
+Prefill and plain decode (llama-bench, no drafter; depth = tokens already in the context):
+
+| depth | pp512 t/s | pp2048 t/s | tg32 t/s |
+|---|---|---|---|
+| 0 | 492 | 487 | 24.6 |
+| 4k | 470 | 463 | 24.2 |
+| 16k | 416 | 413 | 23.2 |
+| 32k | 358 | | 22.0 |
+| 64k | 278 | | 20.0 |
+| 128k | 172 | | 16.9 |
+
+Decode with the drafters (llama-server, 256 generated tokens, temperature 1.0 / top-p 0.95 /
+top-k 20 with `--spec-draft-temp 1.0`; prompt = the first N tokens of wikitext plus "write a
+400-word summary", so the drafters see real long-context work, not repetition; mean of 2 runs):
+
+| depth | none | MTP (n=3) | DFlash2 (adaptive, cap 7) | MTP accepted/drafted | DFlash accepted/drafted |
+|---|---|---|---|---|---|
+| ~0 (essay prompt) | 24.5 | 48.0 | 46.2 | 0.51 | 0.51 |
+| 3.7k | 24.1 | 55.3 | 50.0 | 0.67 | 0.53 |
+| 13.4k | 23.0 | 53.0 | 55.3 | 0.68 | 0.58 |
+| 40k | 21.4 | 48.0 | 41.6 | 0.66 | 0.51 |
+| 79k | 19.3 | 47.2 | 39.2 | 0.77 | 0.52 |
+| 120k | 17.4 | 44.1 | 32.0 | 0.83 | 0.48 |
+
+Whole-prompt prefill as the server reports it (the 120k prompt from an empty cache, so it
+averages over the whole ramp): 279 t/s without a drafter, 268 with MTP, 275 with DFlash.
+
+Reading: MTP holds 2.5x over plain decode all the way to 120k because its acceptance rises with
+context (the summary task becomes more predictable) and its per-step cost does not grow. DFlash2
+is the better drafter up to about 16k-30k and then falls off: its drafter runs its own attention
+over the context, so each draft step gets more expensive with depth while its acceptance stays
+flat at ~0.5. For long-context sessions MTP is the better default; the server currently ships
+with DFlash (the better choice for short mixed work: math, code, lists).
