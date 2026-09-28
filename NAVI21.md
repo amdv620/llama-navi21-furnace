@@ -1,10 +1,12 @@
-# llama-navi21-furnace
+# llama-navi21-furnace: the gfx1030 flash-attention fix (original write-up)
 
-Mainline llama.cpp (`ggml-org/llama.cpp` @ `e613ef2c8`) **plus a flash-attention
-fix for AMD Navi 21 / RDNA2 (gfx1030, e.g. Radeon Pro V620)**.
-
-Everything else is stock upstream. The one change is in
-`ggml/src/ggml-cuda/fattn-tile.cuh`.
+This is the write-up of the first change in this fork: making `-fa on` work on AMD Navi 21 /
+RDNA2 (gfx1030, e.g. Radeon Pro V620). It is kept as written (June 2026, upstream `e613ef2c8`).
+The fork has since grown well past this one change; the current state, performance and the
+full list of changes are in [README.md](README.md) and [PROGRESS-phoebe.md](PROGRESS-phoebe.md).
+In particular, the occupancy-1 configurations described below were later found to be
+workarounds for a wrong occupancy query in HIP and were replaced by a computed occupancy
+(PROGRESS section 14).
 
 ## The bug
 

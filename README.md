@@ -1,126 +1,131 @@
-# llama.cpp
+# llama-navi21-furnace
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+A fork of [llama.cpp](https://github.com/ggml-org/llama.cpp) tuned for **AMD Navi 21 / RDNA2
+(gfx1030)**, in particular the **Radeon PRO V620**: a 32 GB datacenter card that sells cheaply
+second-hand and that upstream's HIP path treats as an afterthought. The goal is the best
+single-card experience for a 27B-class model at long context, with everything measured on
+real hardware and every kernel change bit-exact against upstream's arithmetic.
 
-<div align="center">
+The reference setup is **Swift-Qwen3.8-27B** (UkisAI's fine-tune of Qwen3.8-27B) at Q4_K_XL
+with a speculative drafter, 128k context, on one V620. A from-scratch deployment guide (BIOS,
+kernel, ROCm, build, models, server, web tools) lives in
+[llama-webui-tools/deploy](https://github.com/sixvolts/llama-webui-tools/tree/main/deploy);
+the quantized model and drafters are on Hugging Face at
+[SixVolts/Swift-Qwen3.8-27B-GGUF](https://huggingface.co/SixVolts/Swift-Qwen3.8-27B-GGUF).
 
-<b>LLM inference in C/C++</b>
+## Performance on one V620
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+Swift-Qwen3.8-27B Q4_K_XL (16.6 GiB), flash attention, 128k context, card at 300 W.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+Prefill and plain decode (`llama-bench`; depth = tokens already in the context):
 
-</div>
+| depth | pp512 t/s | tg32 t/s |
+|---|---|---|
+| 0 | 492 | 24.6 |
+| 4k | 470 | 24.2 |
+| 16k | 416 | 23.2 |
+| 32k | 358 | 22.0 |
+| 64k | 278 | 20.0 |
+| 128k | 172 | 16.9 |
 
-## Quick start
+Decode with a drafter (`llama-server`, temperature 1.0 with speculative sampling, so the output
+distribution is the model's own; prompt is real long text plus a summary request):
 
-A few options to get `llama.cpp` installed on your machine:
+| depth | no drafter | MTP (3 tokens) | DFlash2 (adaptive, up to 7) |
+|---|---|---|---|
+| ~0 | 24.5 | 48.0 | 46.2 |
+| 4k | 24.1 | 55.3 | 50.0 |
+| 16k | 23.0 | 53.0 | 55.3 |
+| 40k | 21.4 | 48.0 | 41.6 |
+| 80k | 19.3 | 47.2 | 39.2 |
+| 120k | 17.4 | 44.1 | 32.0 |
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+DFlash2 is the better drafter for short mixed work (math, code, lists: up to 76 t/s); MTP holds
+its speed at depth because its cost does not grow with context. Details, methodology and the
+history of every number are in [PROGRESS-phoebe.md](PROGRESS-phoebe.md).
 
-Once installed:
+## What is changed relative to upstream
+
+The fork tracks upstream `master` (rebased, not merged; see the commit list for the exact base).
+Everything below is scoped to HIP / RDNA2 or to the speculative-decoding code and leaves other
+backends and GPUs byte-for-byte unchanged.
+
+**Flash attention (tile kernel, `ggml/src/ggml-cuda/fattn-*.cuh`)**
+- Occupancy is computed from the kernel's registers and LDS against the WGP instead of HIP's
+  occupancy query, which assumes a quarter of RDNA2's register file and made upstream abort
+  (`GGML_ASSERT(max_blocks_per_sm > 0)`) for head sizes 256 and 512.
+- RDNA2 tile configurations for D=128/256/512/576 (Qwen, Gemma, DeepSeek MLA shapes) and a
+  retune of the D=256 tiles for 3 to 8 token verify batches.
+- The wide (prefill and verify) kernels read Q from a pre-converted global buffer instead of
+  shared memory, which the K reads already saturate: +26 to +30% attention throughput at 16k to 64k
+  context.
+
+**Quantized matmul (MMQ, MMVQ)**
+- The K-quant sub-block scale is applied as a float multiply on AMD (the integer multiply runs at
+  quarter rate there): +8.5% prefill, bit-identical results.
+- RDNA2 entries in the MMVQ tables and a 2-wave, wider block for the 2 to 8 column verify shape.
+- The q8_1 quantization of the activation is reused across matmuls in one graph, with the cache
+  bounded so it cannot overflow the pool under CUDA graphs.
+
+**Graph fusions (CUDA/HIP)**
+- Residual add fused into the following RMS norm and weight multiply; RMS norm fused with scale;
+  `ADD -> SOFTPLUS -> MUL` fused; a run of same-shaped state-snapshot copies issued as one
+  launch; CUDA graphs keyed by shape so batch-size changes do not evict each other.
+- Qwen3.5 / gated delta-net: single-token graph fixes that remove a kernel per layer, the
+  linear-attention state read from the cache instead of a gathered copy, q and k normalized in
+  one op.
+
+**Speculative decoding (`common/speculative.*`, `common/sampling.*`, server)**
+- Speculative sampling (accept with probability min(1, p/q), resample the residual) for DFlash2
+  and MTP drafts when the request samples at temperature > 0: about +15% at temperature 1.0 with
+  no change to the output distribution. Enabled with `--spec-draft-temp 1.0`.
+- Drafts are reproducible for a seeded request (per-request drafter RNG).
+- Adaptive draft length from observed acceptance, reset per request.
+- Reduced draft vocabulary (`d2t`) for the MTP head and DFlash drafters:
+  `scripts/draft-vocab/build-draft-vocab.py` replaces a drafter's output head with the most
+  likely rows of the target's own head, several times cheaper per draft step.
+
+**Chat formats**
+- Cohere Command A (`cohere2`) tool-call and thinking parsing (`common/parsers/cohere2.cpp`).
+
+## Build (gfx1030)
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1030 -DGGML_HIP_ROCWMMA_FATTN=OFF
+cmake --build build -j
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Ubuntu's ROCm packages install under `/usr` and hide the HIP cmake package; the deployment
+guide's `deploy/scripts/build-llama.sh` carries the extra compiler and library paths that layout
+needs, and is the exact build behind the numbers above.
 
-## Description
+## Running the reference setup
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+```sh
+llama-server -m Swift-Qwen3.8-27B-Q4_K_XL-noIQ.gguf -ngl 99 -fa on -c 131072 \
+  -md dflash-Qwen3.8-27B-Q4_0-d2t64k-swiftxl.gguf -ngld 99 \
+  --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-temp 1.0 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0
+```
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+For long-context sessions use the MTP drafter instead:
+`-md mtp-Qwen3.8-27B-d2t64k-swiftxl.gguf --spec-type draft-mtp --spec-draft-n-max 3`.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## Documents
 
-## Supported backends
+- [PROGRESS-phoebe.md](PROGRESS-phoebe.md): the working log of the single-V620 tuning, with
+  every measurement, the negative results, and the reasoning behind each change.
+- [NAVI21.md](NAVI21.md): the original gfx1030 flash-attention write-up (the abort, its root cause,
+  the first fix and its validation across Qwen, Gemma and MoE models).
+- [DEPLOY-NOTES.md](DEPLOY-NOTES.md): serving Qwen3.5-122B-A10B on a 4x V620 box.
+- [COMMAND-A-PLUS-TUNING.md](COMMAND-A-PLUS-TUNING.md): tuning findings for Command A Plus on
+  4x V620.
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+Upstream's README, build guide and tool documentation apply unchanged:
+[docs/build.md](docs/build.md), [tools/server](tools/server/README.md),
+[tools/cli](tools/cli/README.md).
 
-## Documentation
+## License
 
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+MIT, as upstream llama.cpp.
