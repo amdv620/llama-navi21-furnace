@@ -598,3 +598,29 @@ expects 0.59+0.35+0.21+0.12 = 1.26 accepted tokens; a 2-way tree branching at po
 verify rows 5-8 cost 4-5 ms each. Plumbing would be feasible (branches as extra sequence ids;
 common_memory::seq_cp copies both contexts, the recurrent state copy is per-cell) but the ceiling
 is below zero at this acceptance profile.
+
+## 17. 2026-09-28: prefill - the K-quant integer multiply, and the 250 W power cap
+
+**Where prefill time goes.** 90% is the quantized matmul (MMQ). At the same shape, Q8_0 runs at
+37 TOPS while Q4_K/Q5_K (88% of prefill time) run at 24-26; per weight element the earlier
+"Q6_K is faster" reading was a shape effect. Hardware counters: VALU-issue-bound, LDS stalls near
+zero. The card sat at exactly 250 W (its power cap) at ~2350 MHz against a 2570 MHz maximum.
+
+**Kernel (f75d2cd02, +8.5%).** The Q4_K/Q5_K/Q6_K MMQ dot helpers multiplied each sub-block's
+dp4a sum by its integer scale before converting to float: full rate on NVIDIA, quarter rate on
+AMD (`v_mul_lo_u32`), 128 of them per 1024 dot products in the Q4_K loop. The product is exact in
+fp32 (7-bit scale x sum below 2^17), so on HIP it is now a float multiply: bit-identical results,
+pp512 434 -> 470, pp2048 424 -> 459, decode unchanged. Also tried: CU-mode compilation (-11%),
+rocBLAS matmuls (-13%), ubatch 1024/2048 (no change).
+
+**Power (+5.9%).** The VBIOS PowerPlay table sets the SMU limit to 250 W and disables the
+overdrive power-limit capability, so the driver reports min = max = 250 W and `ppfeaturemask`
+cannot change it. Uploading a modified table via `pp_table` made the driver reset the SMU, which
+never came back (GPU wedged, reboot with the reset switch) - do not do that. What works: a 3-line
+patch to `sienna_cichlid_get_power_limit()` raising only the reported maximum to 300 W for PCI
+1002:73a1, built as an out-of-tree `amdgpu.ko` for 7.0.0-34-generic (~/v620-power/, recipe in
+the README there). Setting the cap then uses the normal runtime message and the firmware honors
+it: prefill draws 282 W mean (299 peak) at ~2440 MHz, junction 80 C, pp2048 459 -> 486 t/s,
+pp512 470 -> 491, pp512 at 64k context 246 -> 269; decode is bandwidth-bound and unchanged.
+
+Prefill today: 434 -> 491 t/s at empty context (+13%).
