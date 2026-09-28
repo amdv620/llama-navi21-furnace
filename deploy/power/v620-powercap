@@ -1,0 +1,13 @@
+#!/bin/sh
+# Set the Radeon PRO V620 power cap to its 300 W board rating.
+# Only acts where the driver reports a 300 W maximum (the patched amdgpu module); with the
+# stock module the maximum is 250 W and nothing is written.
+status=1
+for f in /sys/class/drm/card*/device/hwmon/hwmon*/power1_cap_max; do
+    [ -r "$f" ] || continue
+    if [ "$(cat "$f")" = 300000000 ]; then
+        cap="${f%_max}"
+        echo 300000000 > "$cap" && echo "v620-powercap: set $cap to 300 W" && status=0
+    fi
+done
+exit $status

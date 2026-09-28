@@ -8,8 +8,7 @@ real hardware and every kernel change bit-exact against upstream's arithmetic.
 
 The reference setup is **Swift-Qwen3.8-27B** (UkisAI's fine-tune of Qwen3.8-27B) at Q4_K_XL
 with a speculative drafter, 128k context, on one V620. A from-scratch deployment guide (BIOS,
-kernel, ROCm, build, models, server, web tools) lives in
-[llama-webui-tools/deploy](https://github.com/sixvolts/llama-webui-tools/tree/main/deploy);
+kernel, ROCm, build, models, server, web tools) is in [deploy/README.md](deploy/README.md);
 the quantized model and drafters are on Hugging Face at
 [SixVolts/Swift-Qwen3.8-27B-GGUF](https://huggingface.co/SixVolts/Swift-Qwen3.8-27B-GGUF).
 
@@ -96,8 +95,8 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build build -j
 ```
 
-Ubuntu's ROCm packages install under `/usr` and hide the HIP cmake package; the deployment
-guide's `deploy/scripts/build-llama.sh` carries the extra compiler and library paths that layout
+Ubuntu's ROCm packages install under `/usr` and hide the HIP cmake package; 
+`deploy/scripts/build-llama.sh` carries the extra compiler and library paths that layout
 needs, and is the exact build behind the numbers above.
 
 ## Running the reference setup

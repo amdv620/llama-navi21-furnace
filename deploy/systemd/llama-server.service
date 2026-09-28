@@ -1,0 +1,25 @@
+# systemd user service for deploy/serve-v620.sh. Install:
+#   mkdir -p ~/.config/systemd/user && cp deploy/systemd/llama-server.service ~/.config/systemd/user/
+#   edit the Environment= and ExecStart= lines below to your paths and choices
+#   systemctl --user daemon-reload && systemctl --user enable --now llama-server
+#   sudo loginctl enable-linger $USER    # start at boot, without a login session
+# Logs: journalctl --user -u llama-server -f
+[Unit]
+Description=llama-server (Swift-Qwen3.8-27B on a Radeon PRO V620)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=SPEC=dflash
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+ExecStart=%h/llama-navi21-furnace/deploy/serve-v620.sh
+Restart=on-failure
+RestartSec=10
+# SIGINT is what Ctrl-C sends; llama-server shuts down cleanly on it
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,18 @@
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu11/sienna_cichlid_ppt.c
+@@ -665,6 +665,15 @@
+ 	if (max_power_limit) {
+ 		*max_power_limit = power_limit * (100 + od_percent_upper);
+ 		*max_power_limit /= 100;
++
++		/*
++		 * Radeon PRO V620 (0x73a1): a 300 W board whose VBIOS table sets the
++		 * PPT limit to 250 W and disables the overdrive power-limit
++		 * capability, so the range above collapses to 250 W. Let the runtime
++		 * cap go up to the board rating; the SMU still applies it.
++		 */
++		if (smu->adev->pdev->device == 0x73a1 && *max_power_limit < 300)
++			*max_power_limit = 300;
+ 	}
+ 
+ 	if (min_power_limit) {

@@ -1,0 +1,18 @@
+# Set the Radeon PRO V620 power cap to its 300 W board rating at boot.
+# Needs the patched amdgpu module (see README.md); with the stock module the script does nothing.
+# Install:
+#   sudo cp deploy/power/v620-powercap /usr/local/sbin/v620-powercap
+#   sudo cp deploy/power/v620-powercap.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now v620-powercap
+# Check: cat /sys/class/drm/card0/device/hwmon/hwmon*/power1_cap   -> 300000000
+[Unit]
+Description=Radeon PRO V620 power cap 300 W
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/v620-powercap
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
