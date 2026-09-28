@@ -566,3 +566,35 @@ A read-only review of this work proposed ranked ideas; four were tried.
 
 Also found: at temperature 1.0 the same request with the same seed does not give the same text
 from run to run, even on an unchanged build (greedy does). Output comparisons must use greedy.
+
+## 16. 2026-09-28: reproducibility of sampled drafts, p_min, and the draft-tree question
+
+**Seeded requests now repeat (b5032ff9a).** With sampled drafts, the same seeded temp-1.0
+request gave different text twice in a row on one server; plain sampling and greedy drafts
+reproduced exactly. Three causes, found by instrumenting the accept step and diffing two requests:
+1. each drafter sampled from one RNG seeded at construction; it is now per sequence and seeded per
+   request (target chain: seed, verification: seed+1, drafter: seed+2);
+2. DFlash2's 16 candidates per position come back from the GPU top-k in an order that varies
+   between runs; the sampling walk now goes in token-id order (argmax never cared);
+3. the MTP drafter pairs the first prompt token with the previous token's hidden state, which for
+   a prompt at position 0 was whatever the previous request left behind (drafter logits drifted
+   0.03% per request). A sequence starting at position 0 now gets a zero state. With prompt reuse
+   the carried state is the last generated token's, correct when the new prompt continues from it;
+   after an edited or regenerated turn it is stale for one position (not a correctness issue: the
+   target verifies every draft). MTP acceptance on the chat bench with greedy drafts: 36.6% before
+   and after.
+The output distribution is unchanged; greedy text and PPL identical.
+
+**p_min (correction to section 11's "never fires").** On the d2t drafter the confidence gate does
+fire (startup log shows the value; drafts shorten), and loses at every setting on the greedy
+4-prompt set: 59.8 t/s at 0 -> 56.5 at 0.25 (the code prompt's 61.8 -> 48.3 there is a single run)
+-> 56.4 at 0.5 -> 49.2 at 0.8. Shorter drafts lose more accepted tokens than they save verify rows.
+
+**Draft trees: not worth building.** A tree only pays if the target often accepts the drafter's
+second choice. Measured on 7000 chat positions at temp 1.0: the target's probability of the
+drafter's 1st / 2nd / 3rd choice is 0.591 / 0.118 / 0.057. At equal verify rows (5), a chain of 4
+expects 0.59+0.35+0.21+0.12 = 1.26 accepted tokens; a 2-way tree branching at position 1 expects
+(0.591+0.118) x 1.59 = 1.13. Break-even needs a second-choice rate above ~0.21; it is 0.12, and
+verify rows 5-8 cost 4-5 ms each. Plumbing would be feasible (branches as extra sequence ids;
+common_memory::seq_cp copies both contexts, the recurrent state copy is per-cell) but the ceiling
+is below zero at this acceptance profile.
