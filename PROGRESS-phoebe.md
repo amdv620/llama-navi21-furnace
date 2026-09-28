@@ -624,3 +624,36 @@ it: prefill draws 282 W mean (299 peak) at ~2440 MHz, junction 80 C, pp2048 459 
 pp512 470 -> 491, pp512 at 64k context 246 -> 269; decode is bandwidth-bound and unchanged.
 
 Prefill today: 434 -> 491 t/s at empty context (+13%).
+
+## 18. 2026-09-28: long-context attention - Q read from a global buffer
+
+**Where the wide attention kernels' time goes.** The KQ loop of the tile kernel is bound by LDS
+read instructions on RDNA2, not by the dot products: per step each lane reads K (2 x 16 B) and Q
+(4 x 16 B) from shared memory and issues 16 `v_dot2`; the next step's reads only start once this
+step's dot products are done. Removing the Q reads in a timing probe gave +25%, the K reads +13%.
+
+**Change (this commit).** For the wide kernels (D <= 256, 16 or more columns per block, i.e.
+prefill and verify batches of 5 or more tokens) a small pre-pass writes Q scaled and converted
+to `half2` into a contiguous buffer, and the KQ loop reads it from there instead of staging it in
+shared memory. The Q row is the same for every lane of a warp, so the loads are warp-uniform
+and served from cache; the LDS then carries only K. The narrow decode kernels keep the shared-
+memory path (they stream K/V and lose from the extra loads). The 32-column kernel drops from
+219 to 108 VGPRs and from 29.7 to 13.3 KB of LDS.
+
+| | before | after |
+|---|---|---|
+| attention prefill, 512 rows at kv 16k / 64k | 16.5 / 16.4 TFLOPS | 21.5 / 20.7 |
+| 8-token verify at kv 16k / 64k | 265 / 1021 us | 228 / 979 |
+| pp512 at 64k context (server) | 269 t/s | 278 |
+| tg32 at 64k, pp2048 at empty context | unchanged | |
+
+**Bit-exactness, checked properly.** The first comparison showed all outputs differing by ~1%
+(same greedy text on 6 prompts, PPL 3.7871 vs 3.7966, both equally close to the fp32 CPU result)
+although the Q values in the buffer are bit-identical to the shared-memory copy and the ISA has
+the same `v_dot2` chains. The cause is the launch, not the kernel: `launch_fattn` picks the
+number of KV-split blocks from the kernel's occupancy (registers and LDS), and the lighter kernel
+raises the blocks-per-WGP estimate (3 -> 4 for 16 columns, 2 -> 4 for 32), so the KV range is
+combined in a different number of partial softmaxes. With the split pinned to the old value
+(9 blocks at 8 queries, 3 at 512) the new kernel's output is byte-identical to the old at kv 4096
+and 16384. The kernel arithmetic is exact; only the partition of the reduction moved, which it
+already does with context length and GPU.
