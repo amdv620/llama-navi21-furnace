@@ -89,6 +89,10 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 void common_speculative_draft(common_speculative * spec);
 
 // informs the speculative context that n_accepted tokens were accepted by the target model
+// seed the draft sampling RNG (sampled drafts, common_params_speculative_draft::temp) for the next
+// generation of seq_id, so a seeded request reproduces its drafts and therefore its output
+void common_speculative_set_seed(common_speculative * spec, llama_seq_id seq_id, uint32_t seed);
+
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
 // (optional) get/set internal state

@@ -171,6 +171,9 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // (optional) seed the per-sequence draft sampling RNG for the next generation
+    virtual void set_seed(llama_seq_id /*seq_id*/, uint32_t /*seed*/) {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -929,7 +932,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
-    std::mt19937 rng { 0x5eed }; // sampled drafts (params.temp > 0)
+    std::vector<std::mt19937> rngs; // per-seq draft sampling (params.temp > 0), reseeded per request by set_seed()
 
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
@@ -1017,6 +1020,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (is_mrope) {
             free(batch_inject.pos);
             batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
+        }
+
+        rngs.resize(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            rngs[i].seed(0x5eed + i);
         }
 
         smpls.resize(n_seq);
@@ -1261,12 +1269,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             q[k] = std::exp(((double) scores[k] - scores[k_max]) / params.temp);
                             sum += q[k];
                         }
-                        const double tgt = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * sum;
-                        double run = 0.0;
+                        // the selector's candidates come back from the GPU top-k in no fixed order, so walk
+                        // them by token id: the same seed then draws the same token from run to run
+                        int32_t order[64];
+                        GGML_ASSERT(selector_top_k <= 64);
                         for (int32_t k = 0; k < selector_top_k; ++k) {
-                            run += q[k];
+                            order[k] = k;
+                        }
+                        std::sort(order, order + selector_top_k, [&](int32_t a, int32_t b) {
+                            return row[a] < row[b] || (row[a] == row[b] && a < b);
+                        });
+                        const double tgt = std::uniform_real_distribution<double>(0.0, 1.0)(rngs[seq_id]) * sum;
+                        double run = 0.0;
+                        predecessor = order[selector_top_k - 1];
+                        for (int32_t o = 0; o < selector_top_k; ++o) {
+                            run += q[order[o]];
                             if (run >= tgt) {
-                                predecessor = k;
+                                predecessor = order[o];
                                 break;
                             }
                         }
@@ -1360,6 +1379,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
     }
 
+    void set_seed(llama_seq_id seq_id, uint32_t seed) override {
+        GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) rngs.size());
+        rngs[seq_id].seed(seed);
+    }
+
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
         // noop
     }
@@ -1372,7 +1396,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_sampler_ptr> smpls;
 
-    std::mt19937 rng { 0x5eed }; // sampled drafts (params.temp > 0)
+    std::vector<std::mt19937> rngs; // per-seq draft sampling (params.temp > 0), reseeded per request by set_seed()
 
     // backend sampler chain per seq, attached to ctx_dft
     std::vector<llama_sampler *> backend_chains;
@@ -1431,6 +1455,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // llama_batch_init allocates only one of token/embd; MTP needs both.
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+
+        rngs.resize(n_seq);
+        for (uint32_t i = 0; i < n_seq; ++i) {
+            rngs[i].seed(0x5eed + i);
+        }
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1583,6 +1612,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
+                // a sequence starting at position 0 has no previous hidden state: pending_h would
+                // otherwise carry the last state of whatever this slot generated before
+                if (batch_in.pos[i_batch_beg[seq_id]] == 0) {
+                    std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+                }
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
@@ -1749,7 +1783,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         q[k] = std::exp(((double) cur_p->data[k].logit - l_max) / params.temp);
                         sum += q[k];
                     }
-                    const double tgt = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * sum;
+                    const double tgt = std::uniform_real_distribution<double>(0.0, 1.0)(rngs[seq_id]) * sum;
                     double run = 0.0;
                     for (size_t k = 0; k < n_cand; ++k) {
                         run += q[k];
@@ -1824,6 +1858,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
         }
+    }
+
+    void set_seed(llama_seq_id seq_id, uint32_t seed) override {
+        GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) rngs.size());
+        rngs[seq_id].seed(seed);
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
@@ -3044,6 +3083,15 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+    }
+}
+
+void common_speculative_set_seed(common_speculative * spec, llama_seq_id seq_id, uint32_t seed) {
+    if (spec == nullptr) {
+        return;
+    }
+    for (auto & impl : spec->impls) {
+        impl->set_seed(seq_id, seed);
     }
 }
 

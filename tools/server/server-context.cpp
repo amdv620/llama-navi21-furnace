@@ -1832,7 +1832,11 @@ private:
                     sp.temp > 0.0f && sp.mirostat == 0 &&
                     std::find(sp.samplers.begin(), sp.samplers.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == sp.samplers.end();
                 if (slot.spec_sample) {
-                    slot.spec_rng.seed(sp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : sp.seed + 1);
+                    // three independent streams: the target chain uses sp.seed, verification sp.seed + 1,
+                    // the drafter sp.seed + 2. an unseeded request gets fresh randomness for both.
+                    const uint32_t seed = sp.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : sp.seed;
+                    slot.spec_rng.seed(seed + 1);
+                    common_speculative_set_seed(spec.get(), slot.id, seed + 2);
                 }
                 slot.spec_draft_q.clear();
             }
