@@ -560,6 +560,8 @@ A read-only review of this work proposed ranked ideas; four were tried.
 | B2. All 6 query heads of a KV head in one block (ncols2 = 6) | Correct, but every variant spills 23-333 VGPRs to scratch: prefill attention 15.5 -> 3.0 TFLOPS. The tile kernel does not handle a non-power-of-two group size efficiently; would need kernel rework. Not committed. |
 | E. Truncate the drafter's distribution with the request's top-p before sampling | Scored on the same 7000 positions: expected acceptance 0.6654 -> 0.6687 at top-p 0.95 (worse at 0.8). About +0.5%; not implemented. |
 | D. MMVQ for 5-8 token verify: two warp groups each owning half the columns over the same weight rows | Registers 193 -> 98, occupancy 4 -> 9 waves/SIMD, tests pass - and 40% slower (pp8 111 -> 66). The second group's weight reads do not come from cache, so weight traffic doubles. Not committed. |
+| G. Delta-net graph merges | One L2 norm over q and k (5aa13658c): bit-identical, 48 fewer kernels per eval, speed within noise (59.36 -> 59.43). Merging the beta/alpha matmuls would save ~0.6 ms per step (~1%) but needs a combined weight in the GGUF, which upstream llama.cpp could not load; not done. |
+| F. Draft length chosen from the measured verify cost curve | Predicted +0-4%; measured 59.55 -> 58.64 on four prompts (code/essay +2%, math -3%, list -6%) and no change on chat (43.75 vs 43.3). Not committed. |
 | C. MMQ stream-k with more persistent blocks | The old stream-k test was starved (36 blocks, 1 per WGP): 302 t/s at 1x, 415.5 at 2x, but tiling is still faster (428.9). Closed. |
 
 Also found: at temperature 1.0 the same request with the same seed does not give the same text
