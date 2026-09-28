@@ -1182,6 +1182,13 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_deepseek_v3_2(tmpl, params);
     }
 
+    // Cohere Command (Cohere2 / command-a) format detection: thinking + action-array tool calls.
+    if (src.find("<|START_ACTION|>")   != std::string::npos &&
+        src.find("<|START_THINKING|>") != std::string::npos &&
+        src.find("tool_name")          != std::string::npos) {
+        return common_chat_params_init_cohere2(tmpl, params);
+    }
+
     // Gemma4 format detection
     if (src.find("'<|tool_call>call:'") != std::string::npos) {
         if (src.find("{#- OpenAI Chat Completions:") == std::string::npos) {
