@@ -735,3 +735,57 @@ algorithm (an MMQ that beats MMVQ below batch 14 on RDNA2), all config levers ar
 (4) Long-context attention at 38-48% of dot2 peak: latency-bound; more columns per block or
 register blocking, not obvious on RDNA2 without matrix cores. (5) Decode power: a lower clock
 for decode would cut ~100 W with no speed loss (not implemented; needs a DPM policy).
+
+## 21. 2026-09-29: plan against the limits, after an independent review
+
+A first plan (W0-W7 below) was drawn from section 20 and reviewed by a second model with read
+access to the kernels, the traces and the earlier negative results. The review disassembled the
+gfx1030 code objects in `libggml-hip.so` (no GPU needed) and changed the plan in three places:
+
+- **The verify-batch MMVQ kernels are VALU-issue-bound, not latency-bound.** The cost scales
+  linearly with the number of columns (ffn_down: 0.077 / 0.090 / 0.132 / 0.205 ms at 1/2/4/8),
+  which a latency-bound kernel with the same weight loads would not do, and the batch-8 Q4_K
+  kernel has 128 `v_mul_lo_u32` (quarter rate on gfx10) per K-loop iteration against 160
+  `v_dot4`: the same integer scale multiply that f75d2cd02 removed from MMQ is still in the MMVQ
+  dot bodies (`vecdotq.cuh` `vec_dot_q4_K_q8_1_impl_vmmq`, `..q5_K..`, `..q6_K_q8_1_impl_mmvq`).
+  The float form is exact by the same bound argument. Verified in the source and the
+  disassembly. Software prefetch (the plan's W2a) hides latency, not issue, and the split-K
+  (W2c) raises occupancy without reducing VALU work: both dropped.
+- **q8_0 KV (W1) would slow speculative decoding at depth by 20-30% as dispatched today.** On
+  RDNA2 only batch 1-2 goes to the vec kernel, which reads q8_0 natively; every verify batch
+  (3-8 rows) goes to the tile kernel, which needs f16 and gets it by converting the layer's whole
+  K and V cache to a scratch buffer before each call (`launch_fattn`, `need_f16_K/V`). Plain
+  tg32 would show a gain and the shipped path a loss. Needs a dispatch change first.
+- **The K-quant MMQ layout idea (W4) is refuted by data already measured.** Q5_K already uses
+  the unpacked Q8_0-style tile and is the slowest of the three (24.2 vs Q4_K 25.9 vs Q8_0 37.0
+  TOPS). The K-quant excess is the per-sub-block epilogue, already at the bit-exact minimum.
+  The instruction-mix ceiling for Q4_K MMQ is ~40 TOPS, not 76.7; it runs at ~65-74% of that.
+  Realistic bit-exact gain under 10%; exploratory only.
+
+Other corrections: the 32-column attention kernel is at 128 VGPRs (not 108) and its Q loads
+compile to 144 `global_load_dwordx4` per iteration (vector path) instead of scalar loads, a
+third co-limiter next to LDS and VALU and a two-line bit-exact experiment; the fused
+norm+rope kernel never fires for this model (`rope_multi` is not accepted) so 64 launches per
+decode step are available there; the norm-to-q8_1 fusion applies to ~130 of the 257 norms, not
+all; the MTP catch-up merge is output-equivalent but not kernel-bit-exact (different
+partial-sum order in a wider matmul); a 64-column attention tile needs a code branch, not a
+table entry, and lands near 190 VGPRs.
+
+**Revised order**
+
+| # | item | effort | expected | numerics |
+|---|---|---|---|---|
+| 1 | MMVQ K-quant scale multiply in float (Q4_K/Q5_K/Q6_K, HIP only) | 0.5 d | batch-8 MMVQ -5 to -20% (DFlash +4 to +15%), batch-4 -3 to -8% (MTP +2 to +6%), DFlash drafter head too | bit-exact |
+| 2 | thermal and power envelope: sustained 120k prefill with junction and memory temperature, cap curve 300-200 W measured with the drafters on | 0.5 d | reproducibility; shipped cap | none |
+| 3 | decode launches: norm->q8_1 for the ~130 eligible norms, `rope_multi` in the fused norm-rope, KV write via rope+set_rows, conv+gdn | 2 d | +2.5 to 3% decode and verify | bit-exact if the reductions are copied exactly |
+| 4 | MTP catch-up merged into the first draft pass | 0.5 d | +3% MTP | output-equivalent |
+| 5 | attention: V-pass and softmax share probes, then scalar Q loads, then a 64-column tile | 2 d | +5 to 15% on attention at 64k | scalar Q bit-exact; 64-col moves the KV split |
+| 6 | decode power policy from the cap curve | 0.5 d | -60 to -100 W | none |
+| 7 | q8_0 KV with a vec-kernel dispatch for batch <= 8, A/B with drafters | 1 d | +10 to 20% plain decode at 128k; spec path unknown | changes results |
+| 8 | MMQ K-quant loop, exploratory | 3 d | <= +10%, uncertain | mostly not bit-exact |
+
+Gates unchanged: bitwise compare on the model's shapes (mmbench for matmuls, facmp for
+attention at a pinned split), test-backend-ops, the check.sh gate, interleaved warm A/B with
+power and junction logged. Anything not bit-exact is reverted unless decided otherwise; the
+one candidate worth that decision is using the q8_1 block sums for the K-quant min term in MMVQ
+(exact-in-quantization-noise, drops 32 dp4a and 64 mul/cvt per iteration), not the split-K.
