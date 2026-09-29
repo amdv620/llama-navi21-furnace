@@ -3525,6 +3525,39 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // ADD -> RMS_NORM -> MUL(weight): a residual add followed by the next pre-norm. The generic
 // ggml_can_fuse does not apply because the sum has a second consumer (it is also the next
 // residual); the fused kernel writes it, so only the norm output has to be single-use.
+// The MUL_MAT that will consume the fused norm's output `out` as the quantized-activation (MMVQ)
+// operand, if it follows within a few nodes: the norm kernel then emits the q8_1 activation
+// itself and the matmul finds it in the cache instead of launching the quantizer (RDNA2 only).
+static const ggml_tensor * ggml_cuda_norm_mmvq_consumer(const ggml_cgraph * cgraph, const int i, const ggml_tensor * out) {
+    static const bool off = getenv("GGML_CUDA_NO_Q8_1_CACHE") != nullptr || getenv("GGML_CUDA_NO_NORM_Q8_1") != nullptr;
+    if (off) {
+        return nullptr;
+    }
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_RDNA2(cc)) {
+        return nullptr;
+    }
+    if (out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) || out->ne[0] % MATRIX_ROW_PADDING != 0) {
+        return nullptr;
+    }
+    for (int k = i + 1; k < cgraph->n_nodes && k < i + 16; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (n->op != GGML_OP_MUL_MAT || n->src[1] != out) {
+            continue;
+        }
+        const ggml_tensor * src0 = n->src[0];
+        const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                       ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+        if (bad_padding_clear || !ggml_is_quantized(src0->type) || n->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_i32(n, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+            !ggml_cuda_should_use_mmvq(src0->type, cc, out->ne[1])) {
+            return nullptr;
+        }
+        return n;
+    }
+    return nullptr;
+}
+
 static bool ggml_cuda_can_fuse_add_rms_norm_mul(const ggml_cgraph * cgraph, int i) {
     if (i + 2 >= cgraph->n_nodes) {
         return false;
@@ -4424,7 +4457,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse_add_rms_norm_mul(cgraph, i)) {
-        ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2],
+            ggml_cuda_norm_mmvq_consumer(cgraph, i + 2, cgraph->nodes[i + 2]));
         return 2;
     }
 
@@ -4434,7 +4468,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1],
+            ggml_cuda_norm_mmvq_consumer(cgraph, i + 1, cgraph->nodes[i + 1]));
         return 1;
     }
 

@@ -1489,6 +1489,17 @@ struct ggml_cuda_q8_1_cache {
     }
 };
 
+// key of a q8_1 activation buffer: the src1 tensor, its data, shape and strides, the padded row
+// length and the stream (see ggml_cuda_mul_mat_vec_q, and the fused norms that pre-quantize)
+static inline ggml_cuda_q8_1_cache::key_t ggml_cuda_q8_1_cache_key(
+        const ggml_tensor * src1, const void * src1_d, const int64_t ne10_padded, const int stream_no) {
+    const size_t ts = ggml_type_size(src1->type);
+    return { (int64_t) (uintptr_t) src1, (int64_t) (uintptr_t) src1_d,
+             src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+             (int64_t) (src1->nb[1]/ts), (int64_t) (src1->nb[2]/ts), (int64_t) (src1->nb[3]/ts),
+             ne10_padded, (int64_t) stream_no };
+}
+
 struct ggml_cuda_stream_context {
     std::unordered_map<const ggml_tensor *, ggml_cuda_concurrent_event> concurrent_events;
 
