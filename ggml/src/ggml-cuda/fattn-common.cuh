@@ -1173,6 +1173,11 @@ void launch_fattn(
 #endif // GGML_USE_HIP
     GGML_ASSERT(max_blocks_per_sm > 0);
     int parallel_blocks = max_blocks_per_sm;
+    // debugging aid: pin the KV split so two kernels can be compared bit for bit (the split
+    // follows the kernel's occupancy otherwise, and a different split is a different reduction order)
+    if (const char * env = getenv("GGML_CUDA_FA_PARALLEL_BLOCKS")) {
+        parallel_blocks = max_blocks_per_sm = std::max(1, atoi(env));
+    }
 
     const int64_t n_kv = use_sparse ? n_kv_max : K->ne[1];
     const int ntiles_KV = (n_kv + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by KV cache length.
