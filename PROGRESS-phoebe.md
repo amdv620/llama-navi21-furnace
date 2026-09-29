@@ -695,3 +695,43 @@ is the better drafter up to about 16k-30k and then falls off: its drafter runs i
 over the context, so each draft step gets more expensive with depth while its acceptance stays
 flat at ~0.5. For long-context sessions MTP is the better default; the server currently ships
 with DFlash (the better choice for short mixed work: math, code, lists).
+
+## 20. 2026-09-29: profile pass - distance to the hardware limits per area
+
+Method: rocprofv3 kernel traces (CUDA graphs off, so the in-step gaps are larger than in
+production; production wall times from llama-bench with graphs on), per-step segmentation on
+the vocab-head launch, weight bytes from the GGUF (17.06 GB read per token, 52.1 GFLOP/token in
+the matmuls, 16 full-attention layers, 64 KB of KV per token), power and clocks from hwmon at
+0.5 s. Limits used: 505.6 GB/s measured read bandwidth; int8 dot4 peak 90 TOPS at 2.44 GHz
+(76.7 measured by microbench); fp16 dot2 peak 45 TFLOPS; junction limit 100 C.
+
+| area | physics limit | measured | of limit | where the rest goes |
+|---|---|---|---|---|
+| decode, batch 1, empty ctx | 33.8 ms/token (weights / bandwidth) = 29.6 t/s | 40.5 ms = 24.7 t/s | 83% | MMVQ 35.5 ms (95% of bandwidth); 1,050 small kernels 3.3 ms; dispatch gaps ~1.7 ms |
+| decode at 64k | 42.2 ms (weights + 4.3 GB KV) = 23.7 t/s | 50 ms = 20.0 t/s | 84% | attention 9.6 ms for 16 layers = 89% of KV bandwidth |
+| decode at 128k | 50.7 ms = 19.7 t/s | 59 ms = 16.9 t/s | 86% | same |
+| prefill, empty ctx (MMQ) | 90 TOPS int8 (76.7 achievable) | 28.8 TOPS in the MMQ kernels, 25.6 end to end (492 t/s) | 32% of peak, 38% of achievable | VALU issue: dequant and scale instructions per dot4; 23% occupancy at 192-240 VGPRs (section 17, rocprof note). MMQ is 89% of prefill, delta-net 5%, attention 1%, rest 5% |
+| prefill attention at 16k / 64k | 45 TFLOPS fp16 dot2 | 21.5 / 17.1 TFLOPS | 48% / 38% | after the global-Q change the KQ loop's LDS traffic (K only) sits at the same 45 TFLOPS line as compute; the rest is latency at one block per WGP and the V pass. At 64k attention is 42% of the prefill ubatch (777 of 1856 ms), MMQ 51% |
+| verify batch 4 (MTP) | 33.8 ms | 42.7 ms GPU | 79% | MMVQ 39 ms; small kernels 3.5 |
+| verify batch 8 (DFlash) | 33.8 ms | 65.8 ms GPU | 51% | MMVQ 60.6 ms: latency-bound at 22% occupancy, four levers already tried and closed (mtp-perf-anatomy) |
+| MTP drafter, 4 passes/iteration | ~0.54 GB read per pass = 1.1 ms | 6.1 ms per iteration = 1.5 ms per pass | ~70% | |
+| DFlash drafter, 1 block pass | 1.36 GB = 2.7 ms | 5.6 ms | 48% | batch-8 MMVQ, same as the verify |
+| speculative iteration (MTP) | 33.8 ms verify at bandwidth, drafter free: 2.5 tok/iter -> 74 t/s | 48.8 ms GPU, ~52 wall -> 43-48 t/s | ~60% | verify batch inefficiency (9 ms), drafter (6 ms), small kernels (3.5), gaps (2-3) |
+| dispatch / host | 0 | ~1.7-2 ms per step with graphs on (4-5%) | | 1,500-2,100 launches per step |
+
+**Power and heat are now a limit.** Decode draws 261 W at 2480 MHz although it is bandwidth
+bound (the clock is not needed there). Prefill sits at the 300 W cap at 2425-2445 MHz and the
+junction climbs 91 -> 98 C within 22 s of a pp2048 loop, against a 100 C limit (105 C
+emergency); pp2048 measured 476 t/s in that state against 486-492 when cool. A long prefill
+(a 120k prompt is 8 minutes at 300 W) will run into the thermal limit unless the card gets
+more airflow. Prefill throughput is therefore bounded by energy per token as much as by
+instruction count: fewer instructions per MAC is worth exactly as much as it saves in watts.
+
+**What is left, by size.** (1) Batch-8 verify MMVQ: 27 ms per DFlash iteration above the
+bandwidth line, and the same kernel family at batch 4 is 5 ms over; needs a different
+algorithm (an MMQ that beats MMVQ below batch 14 on RDNA2), all config levers are closed.
+(2) Prefill MMQ at a third of the dot4 peak, power-capped; only instruction reduction helps.
+(3) Small kernels and gaps in decode, ~5 ms of 40: op fusion, a few percent each.
+(4) Long-context attention at 38-48% of dot2 peak: latency-bound; more columns per block or
+register blocking, not obvious on RDNA2 without matrix cores. (5) Decode power: a lower clock
+for decode would cut ~100 W with no speed loss (not implemented; needs a DPM policy).
