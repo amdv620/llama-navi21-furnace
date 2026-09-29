@@ -789,3 +789,92 @@ attention at a pinned split), test-backend-ops, the check.sh gate, interleaved w
 power and junction logged. Anything not bit-exact is reverted unless decided otherwise; the
 one candidate worth that decision is using the q8_1 block sums for the K-quant min term in MMVQ
 (exact-in-quantization-noise, drops 32 dp4a and 64 mul/cvt per iteration), not the split-K.
+
+## 22. 2026-09-29: working the plan - items 1 and 2
+
+**Item 1 (76fa4d1ef): K-quant scale multiply in float in the MMVQ dot bodies.** The batch-8 Q4_K
+kernel went from 128 `v_mul_lo_u32` per K-loop iteration to 0 (Q5_K 128 -> 0, Q6_K 64 -> 0,
+batch-4 Q4_K 32 -> 0). Bit-identical on every model shape at 1/4/8 columns, test-backend-ops
+MUL_MAT 1297/1297, PPL and greedy text identical. pp8 114.5 -> 126.4 t/s (+10%); pp4 and tg64
+unchanged; DFlash2 greedy math 64.3 -> 72.0, code 58.4 -> 61.6; MTP unchanged (its batch-4 kernel
+had a quarter of the multiplies).
+
+**Item 2: power and thermal envelope.** The driver accepts caps from 250 to 300 W only (the
+patched module raises the maximum, the minimum stays at the VBIOS 250).
+
+| cap | tg128 | pp2048 | DFlash math | decode power | prefill power / sclk / junction |
+|---|---|---|---|---|---|
+| 300 W | 24.7 | 480 | 70.6 | 259 W | 297 W / 2455 MHz / 93 C |
+| 275 W | 24.7 | 469 | 71.4 | 248 W | 269 W / 2400 MHz / 90 C |
+| 250 W | 24.7 | 456 | 70.4 | 238 W | 245 W / 2325 MHz / 86 C |
+
+Sustained: a 120k-token prompt (7.3 minutes of prefill) at 300 W runs at 276.8 t/s with the
+junction at 98 to 102 C from the first minute on (limit 100 C, emergency 105), memory 82 C, and
+the clock throttled to 2275 to 2365 MHz; at 275 W the same prompt runs at 274.5 t/s with the
+junction at 97 to 101 C and the clock dipping to 2210. So the cap is not what limits long
+prefill; the cooling is. The card is passive and needs chassis airflow the current setup does not
+give it. Until that changes, long prompts run 5 to 8% below the short-burst numbers whatever the
+cap, and the shipped cap stays at 300 W (best for short work, no worse sustained). Decode at
+batch 1 draws 240 to 260 W at 2480 MHz regardless of the cap; nothing in this range lowers it.
+
+**Item 3 (decode launches).** Three pieces, each gated by the greedy/PPL compare against the
+previous build:
+- 3a (80d184f1b): the fused rms_norm+mul+rope kernel rejected this model's rope mode (Qwen3.5
+  uses the interleaved multi-section rope, mode 40) so q and k ran norm, multiply and rope_multi
+  separately. The kernel now carries the four sections and the interleaved selection copied
+  from rope_multi; identical output. 32 launches fewer per step, tg64 24.67 -> 24.77.
+- 3b (df346917a): the fused norms write the q8_1 activation for the matmul that consumes them,
+  registered in the q8_1 cache under the matmul's key; the quantizer launch disappears for
+  every norm-fed matmul (attention qkv, ffn gate/up, the delta-net input projections). The
+  epilogue repeats quantize_q8_1's lane mapping and warp reductions, so it is bit-identical.
+  Quantize launches ~257 -> ~130 per step, total launches 1823 -> 1687, tg64 24.6 -> 24.9.
+  The remaining quantizes sit on matmul outputs (swiglu, gated attention output), which no
+  norm kernel can absorb.
+- 3c, rejected: also fusing the K-cache write (norm+rope+set_rows in one kernel, writing f16
+  directly) removed 16 more launches and measured tg64 24.9, but the greedy text changed on 4
+  of 6 prompts (PPL equal to four digits): the fused f16 store does not round the rope result
+  the way rope-then-set_rows does. Not bit-exact, dropped.
+
+**Item 5a, rejected: scalar loads for Q in the wide attention kernel.** Marking the Q buffer
+parameter restrict makes the compiler use scalar (SMEM) loads for the warp-uniform Q reads
+(hot loop: 144 vector loads -> 16 vector + 125 scalar). It is 14% slower (20.8 -> 17.9 TFLOPS
+at 16k and 64k): on RDNA2 scalar loads and LDS reads share the lgkmcnt wait counter, so every
+wait for K from LDS also waits for the Q loads. Reverted; the reviewer's estimate assumed the
+two paths were independent.
+
+**Item 6, dropped.** The driver's cap range is 250 to 300 W and batch-1 decode draws 240 to
+260 W at max clock with the cap at any of them (section 22); a phase-dependent cap would save
+under 20 W. Not worth the root plumbing.
+
+**Item 5b: where the wide attention kernel's time goes** (512 rows, kv 16k, 9.9 ms per layer,
+timing builds with one part removed; the V-pass FMA-only probe was invalid and is omitted):
+
+| removed | time | share |
+|---|---|---|
+| V pass (V and P reads from LDS + the half2 FMAs; V tile loads kept) | 6.86 ms | 31% |
+| KQ dot products (K and Q reads kept) | 9.02 ms | 9% |
+| exp in the softmax | 9.73 ms | 2% |
+
+With the K reads at 13% and the Q reads at 25% from the earlier probes, the kernel is about
+40% reads for the KQ loop, 31% V pass, 9% KQ math, and the rest tile loads, softmax and
+barriers. No single part dominates, which is why the remaining lever is a wider column tile
+(more MACs per byte read from LDS and per Q load): a 64-column D=256 tile needs a dispatch
+branch, a config entry and about 190 VGPRs, for an estimated +10% on the attention share, i.e.
++4% on pp512 at 64k. Its KV split would move with the register count, so it is exact per
+element but not byte-identical unpinned. Left for a decision.
+
+**State after this pass** (deploy build d74bc5922, one V620 at 300 W, cool card):
+
+| | before (05a3f7086) | after |
+|---|---|---|
+| pp512 / tg32 at empty context | 492 / 24.6 | 492 / 24.8 |
+| pp512 / tg32 at 64k | 276 / 20.0 | 276 / 20.2 |
+| pp4 / pp8 (verify batches) | 82.6 / 114.5 | 82.6 / 127.0 |
+| DFlash2 greedy math / code / essay | 64.3 / 58.4 / - | 70.9 / 62.0 / 40.2 |
+| MTP greedy math / code / essay | 63.9 / 54.8 / - | 63.7 / 54.7 / 46.4 |
+
+Every landed change is bit-identical to the previous build (greedy text on 6 prompts and PPL
+unchanged). Not done from the plan: item 4 (MTP catch-up merge, +3%, deferred: the drafter's
+KV positions across process/draft are more entangled than the review assumed), item 5c (the
+64-column attention tile, needs a decision on the moving KV split), items 7 and 8 (dropped as
+not bit-exact).
