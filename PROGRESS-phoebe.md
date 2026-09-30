@@ -878,3 +878,14 @@ unchanged). Not done from the plan: item 4 (MTP catch-up merge, +3%, deferred: t
 KV positions across process/draft are more entangled than the review assumed), item 5c (the
 64-column attention tile, needs a decision on the moving KV split), items 7 and 8 (dropped as
 not bit-exact).
+
+**Thermal follow-up (2026-09-30).** The first sustained runs were taken with the blower drawing
+another machine's exhaust. With a cool intake and two 120 mm fans added along the card, the
+same 120k prefill at 300 W: 280.7 t/s (was 276.8), power held at 298 W mean (was 290), clock
+mostly 2360 to 2440 MHz with brief dips to 2315 (was 2275 to 2365), edge 75 C, memory 76 C
+(was 82). The junction still reaches 100 C after about 150 s and stays there, so the firmware
+still trims the clock by 2 to 5% for the rest of a long prompt. The junction-to-edge gap is a
+steady 22 to 25 C at 300 W, which is normal for the die-to-heatsink interface (no repaste
+needed); what remains is the fin stack's own limit at this power. Two-minute burst test with
+the cool intake: edge 78 -> 72 C, junction 101 -> 97, clock 2345 -> 2445 MHz at the end, pp2048
+473 -> 481 t/s.
