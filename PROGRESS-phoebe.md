@@ -925,3 +925,68 @@ rejected (3c, 4, 5a, 5c, 6), or dropped as not bit-exact (7, 8). The landed set 
 characterized. What remains above the current numbers needs either the bit-exact rule relaxed
 (q8_0 KV for long-context decode, the q8_1 block-sum min term in MMVQ) or a different algorithm
 for the batch-4-to-8 matmuls.
+
+## 23. 2026-09-30: research - the verify-batch matmul (MMVQ at 4 to 8 columns)
+
+**Terms.** GEMV is a matrix times one vector (decode); GEMM is a matrix times many columns
+(prefill). MMVQ (`mul_mat_vec_q`) is llama.cpp's quantized GEMV kernel, extended to up to 8
+activation columns; every verify step of speculative decoding (draft tokens plus one) runs on
+it. MMQ (`mul_mat_q`) is the quantized GEMM used for prefill; below about 13 columns it is
+slower than MMVQ because it dequantizes a 128-row tile into shared memory whatever the column
+count.
+
+**How MMVQ works** (Q4_K): a 256-weight block is split across 16 lanes, 16 weights each; a
+workgroup of one wave handles 4 rows; each lane, per K iteration, loads 2 ints of weights per
+row, the scales, and for every column 4 ints of q8_1 activation plus 2 block scales, then per
+(row, column) runs 4 `v_dot4` for the weights and 2 for the activation sums, and applies the
+sub-block scale and min in float. Partial sums are reduced across the 16 lanes at the end.
+
+**Cost per column, measured** (16 distinct ffn-sized matrices per graph, so nothing sits in the
+infinity cache; ms per matmul, Q4_K 5120 x 17408):
+
+| columns | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| ms | 0.139 | 0.140 | 0.142 | 0.143 | 0.147 | 0.149 | 0.169 | 0.208 |
+| VGPRs of the instance | 31 | 62 | 62 | 78 | 132 | 155 | 173 | 195 |
+| waves per SIMD | 8 | 8 | 8 | 8 | 7 | 6 | 5 | 5 |
+
+Flat to 6 columns (+7%), then +14% at 7 and +40% at 8. The per-column arithmetic is not the
+problem: the 8-column instance issues the fewest instructions per dot product of all (5.9,
+against 6.7 at 4 columns and 13.6 at 1). The instances lose occupancy as their register count
+grows, and at 5 waves per SIMD the memory latency is no longer hidden. Q5_K is worse (199
+VGPRs at 8 columns) and is 37% of the weights.
+
+**Instruction census of the 8-column K loop** (939 instructions per iteration, 160 dot4):
+float multiply/fma/add 352 (the per-sub-block scale and min epilogue, fixed under bit-exact
+rules), address and integer 142, int-to-float conversions 100, global loads 72 (all hoisted to
+the top of the iteration), nibble unpacking 68, wait counts 21. The reducible part without
+touching the arithmetic order is at most a quarter of the loop.
+
+**Experiments, all bit-identical by construction (same per-output operation order):**
+- Compiler barrier splitting the 8 columns' activation loads into two halves (to cut live
+  registers): Q4_K 8-column VGPRs 195 -> 184, still 5 waves; Q5_K got worse (220); in-model
+  pp8 127 -> 119. The exposed second-half loads cost more than the occupancy gained. Rejected.
+- DFlash draft cap 6 instead of 7 (verify batch 7 instead of 8): math 63 vs 69 t/s, code and
+  essay equal. The batch-8 cost is worth the acceptance. Cap stays at 7.
+- 2 rows per block instead of 4 for the 7/8-column instances: VGPRs 195 -> 111 (Q4_K),
+  199 -> 121 (Q5_K), all instances back to 8 waves per SIMD, and slower: microbench N=7 0.169 ->
+  0.189 ms, N=8 0.208 -> 0.200; in-model pp7 121 -> 109, pp8 128 -> 124, DFlash math 72.5 ->
+  69.4. Each activation load now serves 2 rows instead of 4, and the extra cache traffic costs
+  more than the occupancy gains. Rejected.
+
+**Where this leaves the verify matmul.** At 4 columns (MTP) it runs at 86% of the bandwidth
+line and there is nothing to take. At 7 and 8 columns (DFlash) it is 40% over the line because
+of a register cliff: the instances fit 5 waves per SIMD, and both ways of buying occupancy
+(fewer live loads, fewer rows per block) cost more in exposed latency or lost reuse than they
+return. The float epilogue that dominates the loop is fixed by the bit-exact rule, since any
+refactoring of the per-sub-block scale and min terms (deferring the scale, using the q8_1 block
+sums for the min term, splitting K across waves) changes the rounding order. The DFlash cap of 7
+is still the right setting despite the cliff, because the eighth row buys acceptance on math.
+
+What a purpose-built kernel would do, and why it is off the table under the rule: hold the
+activation columns and a K slice in registers, split K across 2 to 4 waves per row group so the
+latency is hidden by parallelism instead of by registers, and apply the K-quant scales once per
+sub-block rather than once per column. Every one of those reorders the summation. The prize if
+it reached the bandwidth line: batch-8 verify 60 -> 34 ms, DFlash iteration about 48 -> 30 ms,
+roughly +40 to +60% on math and code with the drafter; MTP +15%. That is the largest remaining
+gain on this card, and it needs "same math, any summation order" to be acceptable.
