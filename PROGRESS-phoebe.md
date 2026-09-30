@@ -897,3 +897,31 @@ median 2435 MHz with brief dips to 2275 to 2345, junction settling at 98 to 99 C
 about 1%, down from 5 to 8% with the original airflow. The remaining margin is the fin stack at
 this power; further fans would be diminishing returns. The earlier statement that long
 prompts lose 5 to 8% is retracted for this setup.
+
+**Item 5c, rejected: 64-column D=256 attention tile.** Added an RDNA2 dispatch branch and config
+for 64 columns per block (32 per head group). 8 warps with 8 columns each: 163 VGPRs, no spill,
+17 KB LDS, but 14.0 TFLOPS against 20.9 for the 32-column tile (pp512 at 64k 279 -> 256 t/s).
+16 warps with 4 columns each: 102 VGPRs, 19.5 to 20.5 TFLOPS, still slower. Neither is
+byte-identical to the 32-column kernel at a pinned KV split (a handful of elements differ), so
+it fails the rule as well as the clock. Reverted. The reviewer's +10% estimate did not survive
+contact; the wider tile halves K reuse per warp only on paper, since the V pass and the
+softmax scale with columns per warp too.
+
+**Item 4, rejected: MTP catch-up merged into the first draft pass.** Implemented (process()
+leaves the catch-up batch pending, draft() keeps the accepted prefix, appends its row and decodes
+once; flush and drop paths for prompt chunks and new prompts). Greedy text identical on four
+prompts including a chunked long prompt, but MTP fell from 63.8 to 50.5 t/s on math. Bisected:
+the same plumbing with a separate catch-up decode is already 12% slower (56.1 t/s), because
+upstream issues the catch-up from inside the target's decode callback, where it overlaps with
+the target's GPU work; anything done in draft() runs after the host has waited for the target's
+logits and is fully exposed. The merged decode on top of that lowers draft acceptance from 0.81
+to 0.58 (mean draft length 3.4 -> 2.7), so the batched drafter pass is also not equivalent for
+the later draft rows. Reverted. The review's "+3%" assumed the catch-up was on the critical path;
+it is not.
+
+With items 4 and 5c closed, every item of the plan is either landed (1, 3a, 3b), measured and
+rejected (3c, 4, 5a, 5c, 6), or dropped as not bit-exact (7, 8). The landed set is worth about
++10% on batch-8 verify (DFlash +5 to 12%), +1.5% on decode, and the thermal envelope is
+characterized. What remains above the current numbers needs either the bit-exact rule relaxed
+(q8_0 KV for long-context decode, the q8_1 block-sum min term in MMVQ) or a different algorithm
+for the batch-4-to-8 matmuls.
