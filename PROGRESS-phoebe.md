@@ -990,3 +990,36 @@ sub-block rather than once per column. Every one of those reorders the summation
 it reached the bandwidth line: batch-8 verify 60 -> 34 ms, DFlash iteration about 48 -> 30 ms,
 roughly +40 to +60% on math and code with the drafter; MTP +15%. That is the largest remaining
 gain on this card, and it needs "same math, any summation order" to be acceptable.
+
+**Reordering allowed: a purpose-built kernel, three layouts, all slower.** With the
+summation-order rule relaxed for this matmul (measured first: perplexity through the 8-column
+and 4-column verify kernels vs the prefill GEMM is 3.7865 / 3.7894 / 3.7956 +/- 0.206, a
+twentieth of the error bar), a new kernel was written for Q4_K, Q5_K and Q6_K at 2 to 8 columns
+(`docs/phoebe/mmvq-wide-rejected.cuh`): a lane owns whole 16- or 32-weight runs read with
+16-byte loads, each column's activations come as 16-byte loads, the sub-block scales are applied
+once per lane, no activation-sum dot products in the final variant. Numerically correct (max
+error 1e-6 of the output rms against the generic kernel on all three types).
+
+| variant | Q4_K, 8 columns | note |
+|---|---|---|
+| generic MMVQ | 0.208 ms | |
+| 32 weights per lane, block sums for the min term | 0.195 ms | min term uses the prefill path's approximation; 4 to 6 columns 10 to 15% slower |
+| 16 weights per lane, exact sums, 4 rows per wave | 0.239 ms | |
+| same, 2 rows per wave | 0.257 ms | 6 waves per SIMD |
+| same, 8 rows per wave | 0.325 ms | spills |
+
+Counters for the last layout vs generic at 8 columns: VALU instructions -37%, memory
+instruction cycles -47%, wait cycles -78%, occupancy 27% vs 22%, and 19% more busy cycles,
+with the texture-address unit at 91 to 93% in both and 13% busier for the wide kernel. On
+RDNA2 that unit is the resource both kernels saturate, and it charges per lane and cache line
+per instruction, not per instruction: the generic kernel's pattern of consecutive lanes reading
+consecutive dwords is already the cheapest per byte, and wider loads from lane-strided addresses
+cost the same or more. The 40% cliff at 8 columns is that unit's cost for the extra activation
+re-reads, and no lane mapping over the GGUF layout reduces it: every wave must re-read the
+activations for its rows, and a wave cannot cover more rows without either spilling or reading
+its weights lane-strided. The only design left is a repacked weight layout (rows interleaved in
+16-byte pieces so a wave streams contiguous 512-byte runs with one row per lane, activations
+broadcast through the scalar cache), which is a custom buffer type and a project of its own.
+
+Verify matmul, final: the generic MMVQ stays. Batch 4 at 86% of the bandwidth line, batch 8 at
+55%, and the gap is the address unit, not arithmetic or occupancy.
