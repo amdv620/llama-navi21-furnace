@@ -1096,3 +1096,49 @@ matmul gain itself is real but bounded: the path is at 57% memory-unit busy and 
 scalar-load latency, and the 8-column verify step goes from 60 to about 50 ms per iteration,
 not to the 34 ms bandwidth line. Left as an environment-gated experiment (default off);
 `GGML_CUDA_ROWPACK=1`, `_TYPES`, `_MIN`, `_WAVES` select it.
+
+## 25. 2026-09-30: final performance table (build 2236e6b42)
+
+Swift-Qwen3.8-27B Q4_K_XL, one V620 at 300 W (sealed shroud, two 12 V 120 mm fans on the card,
+section 22), build 2236e6b42, 128k context, flash attention, repacked layout off (its default;
+the side buffers do not fit at 128k with a drafter). The server was restarted on this build.
+
+Prefill and plain decode (llama-bench, no drafter; depth = tokens already in the context):
+
+| depth | pp512 t/s | pp2048 t/s | tg32 t/s |
+|---|---|---|---|
+| 0 | 494 | 488 | 24.8 |
+| 4k | 471 | 465 | 24.4 |
+| 16k | 418 | 414 | 23.3 |
+| 32k | 359 | | 22.1 |
+| 64k | 278 | | 20.1 |
+| 128k | 172 | | 17.0 |
+
+Verify-sized batches: pp4 82.8, pp8 127.2 (148.5 with `GGML_CUDA_ROWPACK=1` and both types,
+section 24).
+
+Decode with the drafters (llama-server, 256 generated tokens, temperature 1.0 / top-p 0.95 /
+top-k 20 with `--spec-draft-temp 1.0`; prompt = the first N tokens of wikitext plus "write a
+400-word summary"; mean of 2 runs):
+
+| depth | none | MTP (n=3) | DFlash2 (adaptive, cap 7) | MTP accepted/drafted | DFlash accepted/drafted |
+|---|---|---|---|---|---|
+| ~0 (essay prompt) | 24.7 | 48.2 | 48.3 | 0.52 | 0.51 |
+| 3.8k | 24.3 | 51.6 | 51.0 | 0.60 | 0.52 |
+| 16.7k | 23.2 | 51.4 | 59.9 | 0.64 | 0.60 |
+| 40k | 21.5 | 48.2 | 42.9 | 0.66 | 0.50 |
+| 78k | 19.4 | 48.5 | 39.7 | 0.80 | 0.53 |
+| 120k | 17.5 | 44.4 | 32.8 | 0.83 | 0.49 |
+
+Whole-prompt prefill of the 120k prompt from an empty cache: 281 t/s without a drafter, 271
+with MTP, 276 with DFlash.
+
+Against section 19 (build 5c913c0d2): prefill is unchanged (same kernels; the +1% is the
+cooling); plain decode is 0.5 to 1% faster from the norm-to-q8_1 fusion (section 22); the
+drafted columns are within run-to-run noise. The noise floor of the drafted columns is about
+2 t/s: the two MTP runs at 3.8k gave 54.2 and 49.0, since the drafts are sampled at temperature
+1.0 and the acceptance varies with the sample. The 16k row is a longer prompt than section 19's
+(16.7k against 13.4k tokens), so its DFlash number is not a like-for-like comparison. The
+picture from section 19 stands: MTP holds 2.5x over plain decode to 120k, DFlash2 is ahead up
+to about 16k-30k and falls off with depth, and the server ships with DFlash for short mixed
+work.

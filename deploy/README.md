@@ -341,6 +341,37 @@ pages with your API key. Only bind to `0.0.0.0` on a network you trust, or add `
 Other settings (`CTX`, `THREADS`, `PORT`, paths) are described at the top of `serve-v620.sh`;
 extra arguments are passed to llama-server.
 
+### Sampling settings
+
+`serve-v620.sh` starts the server with the Swift model card's sampling: temperature 1.0,
+top-p 0.95, top-k 20, min-p 0, no repetition penalty (1.0) and no presence penalty (0). The
+GGUF carries the same values as metadata (`general.sampling.temp`, `.top_p`, `.top_k`), and the
+chat template's default reasoning effort is `xhigh`, the level Swift's benchmarks were run at,
+so nothing has to be sent for thinking either. To see what the server is using:
+
+```
+curl -s localhost:8080/props | python3 -c "import json,sys; p=json.load(sys.stdin)['default_generation_settings']['params']; print({k: p[k] for k in ('temperature','top_p','top_k','min_p','repeat_penalty','presence_penalty')})"
+```
+
+The base model's card (Qwen3.5-27B) suggests a presence penalty of 1.5 for general
+thinking-mode use; Swift's card and its benchmark runs use 0, which is what the launcher uses.
+llama-server's penalties look at the last 64 tokens (`--repeat-last-n`), not the whole reply as
+in vLLM, so the two are not the same setting anyway. Change any of these on the command line
+(`--temp`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, passed through by the
+launcher) or per request. The drafters take the request's sampling as it is: with
+`--spec-draft-temp 1.0` a sampled request accepts drafts with the p/q rule, so the output
+distribution is the model's own at whatever temperature was asked for; temperature 0 uses
+exact-match verification.
+
+**The web UI's own settings.** In the settings dialog ("Sampling & Penalties") the sampling
+fields are empty by default, which means "use the server's value", and the dialog shows the
+server's value for each. A field you fill in is sent with every request from that browser and
+overrides the server; "Reset to default" empties it again. These settings live in the browser
+(localStorage), so every browser has its own, and a browser that used an older build of the UI
+may still hold that build's hard-coded defaults (temperature 0.8, top-k 40, min-p 0.05) and keep
+sending them. After updating the server, open the settings dialog once in each browser and
+reset any filled-in sampling field.
+
 ## 11. Start at boot
 
 ```
