@@ -889,3 +889,11 @@ steady 22 to 25 C at 300 W, which is normal for the die-to-heatsink interface (n
 needed); what remains is the fin stack's own limit at this power. Two-minute burst test with
 the cool intake: edge 78 -> 72 C, junction 101 -> 97, clock 2345 -> 2445 MHz at the end, pp2048
 473 -> 481 t/s.
+
+**Thermal, final state (2026-09-30).** Shroud leak at the power connectors sealed, both side
+fans 12 V: sustained 120k prefill at 300 W 281.5 t/s, power 299 W mean the whole run, clock
+median 2435 MHz with brief dips to 2275 to 2345, junction settling at 98 to 99 C (momentary
+101), edge 74 to 75 C, memory 74 C. Against the cool-card short-burst rate this is a loss of
+about 1%, down from 5 to 8% with the original airflow. The remaining margin is the fin stack at
+this power; further fans would be diminishing returns. The earlier statement that long
+prompts lose 5 to 8% is retracted for this setup.
