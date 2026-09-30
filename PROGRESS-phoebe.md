@@ -1023,3 +1023,76 @@ broadcast through the scalar cache), which is a custom buffer type and a project
 
 Verify matmul, final: the generic MMVQ stays. Batch 4 at 86% of the bandwidth line, batch 8 at
 55%, and the gap is the address unit, not arithmetic or occupancy.
+
+## 24. 2026-09-30: repacked weight layout for the verify matmul (experiment, GGML_CUDA_ROWPACK=1)
+
+**Idea.** Section 23 found the generic MMVQ kernel bound by the texture-address unit, mostly on
+the activations it re-reads for every 4 rows. If the weights are stored so that 32 consecutive
+rows are interleaved in 16-byte pieces, a wave with one row per lane streams contiguous
+512-byte runs, the activations become wave-uniform and can be read through the scalar path (an
+SGPR operand of `v_dot4`), never touching the vector memory unit, and each lane owns whole rows,
+so there is no cross-lane reduction. Small row counts split K across waves and reduce the
+partials in a fixed order. The layout is built once per weight tensor into a side buffer
+(`ggml/src/ggml-cuda/mmvq-rowpack.cuh`, RDNA2, Q4_K/Q5_K, 2D weights, no fusion; the Q6_K
+variant exists but is disabled, see below).
+
+**Numerics.** fp32 summation in a different order and the q8_1 block-sum min term (as MMQ).
+Q6_K, which has no min term, matches the generic kernel to 2e-6 of the output rms; with exact
+activation sums Q4_K matches to 1e-3 (the fp16 block scale both carry); perplexity through the
+path: 3.7927 (Q4_K) / 3.7754 (Q5_K) against 3.7865 +/- 0.206 generic.
+
+**What it took to make it fast.** The standalone kernel was 20% faster than the generic one from
+the start; inside ggml it was not, because the compiler did the activation address arithmetic
+in 64-bit vector registers and moved every address to the scalar unit (68 `v_readfirstlane` and
+1,000 extra VALU instructions per super-block). 32-bit offsets with per-column bases hoisted out
+of the loops and explicitly wave-uniform split bounds fixed it. The split target (about 1,000
+waves) and the column threshold (6) were swept. Staging the activations through shared memory
+with a one-block-ahead prefetch was measured 5x slower: broadcast reads land in vector
+registers, both dot operands then need VGPRs, and the 8-column instance spills.
+
+**Microbench, ms per matmul (16 distinct matrices per graph):**
+
+| shape, columns | generic | repacked |
+|---|---|---|
+| Q4_K 5120x17408, 4 / 6 / 8 | 0.143 / 0.149 / 0.204 | 0.154 / 0.166 / 0.170 |
+| Q4_K 17408x5120, 4 / 6 / 8 | 0.150 / 0.155 / 0.197 | 0.149 / 0.152 / 0.156 |
+| Q4_K 5120x10240, 4 / 6 / 8 | 0.101 / 0.107 / 0.138 | 0.105 / 0.108 / 0.111 |
+| Q5_K 5120x17408, 4 / 6 / 8 | 0.169 / 0.172 / 0.217 | 0.174 / 0.186 / 0.195 |
+| Q5_K 17408x5120, 4 / 6 / 8 | 0.186 / 0.179 / 0.220 | 0.169 / 0.173 / 0.178 |
+| Q6_K 5120x17408, 5 / 8 | 0.199 / 0.217 | 0.233 / 0.230 (disabled) |
+
+At 8 columns 17 to 21% faster (Q4_K) and 10 to 19% (Q5_K); at 4 to 6 columns even or slightly
+slower, so the path is taken from 6 columns up. Counters at 8 columns (Q4_K): VALU instructions
+-81%, vector-memory cycles -96%, busy cycles -56%, memory unit 57% busy against 93%; the
+remaining time is exposed scalar-load latency (about 8 waits per super-block per wave with ~7
+waves per SIMD), which shared-memory staging cannot fix (above) and SGPR prefetching cannot
+hold (104 SGPRs against 144 per column chunk). Q6_K's generic kernel is already the most
+efficient of the three (fewest loads per byte) and the repacked one does not beat it.
+
+**End to end** (llama-bench and greedy DFlash on build-dev; the side buffers duplicate the
+weights, so Q4_K and Q5_K together only fit at 4k context and not with a drafter loaded):
+
+| | generic | Q4_K repacked | Q5_K repacked | both |
+|---|---|---|---|---|
+| pp8 | 127.8 | 138.3 | 136.3 | 148.5 |
+| pp6 (threshold 6) | 120.6 | | | 115.6 |
+| pp4 / tg32 | 82.9 / 24.8 | 82.8 / 24.8 | | 82.2 / 24.8 |
+| DFlash math / code / essay | 72.3 / 62.2 / 40.4 | 75.0 / 63.0 / 43.1 | 74.2 / 62.0 / 39.4 | (does not fit) |
+| MTP math | 63.9 | 63.9 | | 64.0 |
+| PPL, 8-token micro-batches | 3.7865 | 3.7927 | 3.7754 | 3.7749 |
+
+So the batch-8 verify step is 17% faster with both types, which the drafters turn into +2 to
++7% by prompt (the verify step is about 60% of a DFlash iteration and only its 8-row batches
+qualify); 6 columns is slower, so the threshold is 7; MTP (batch 4) and plain decode do not
+change. The block-sum min term and the reordered summation move perplexity by less than a
+tenth of its error bar.
+
+**Where it stands.** The layout works and the kernel is where the section 23 analysis said the
+gain would be, but the shipping cost is the layout itself: the side buffers cannot coexist with
+the model (14 GB), so a real deployment has to store the weights in this layout only, which
+means every kernel that reads Q4_K/Q5_K weights on the device (MMQ for prefill, the
+dequantizers, get_rows) has to understand it, or the tensors have to be stored twice. The
+matmul gain itself is real but bounded: the path is at 57% memory-unit busy and stalls on
+scalar-load latency, and the 8-column verify step goes from 60 to about 50 ms per iteration,
+not to the 34 ms bandwidth line. Left as an environment-gated experiment (default off);
+`GGML_CUDA_ROWPACK=1`, `_TYPES`, `_MIN`, `_WAVES` select it.

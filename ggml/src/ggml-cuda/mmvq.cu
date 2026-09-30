@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-rowpack.cuh"
 #include <memory>
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -1567,6 +1568,15 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    {
+        // EXPERIMENT: repacked-weight kernel (see mmvq-rowpack.cuh)
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (ne12 == 1 && ne13 == 1 && ggml_cuda_rowpack_applicable(src0, ids, fusion != nullptr, ncols_dst, cc)) {
+            ggml_cuda_mul_mat_vec_rowpack(ctx, src0, src1_q8_1_ptr, dst_d, ncols_dst, stride_col_y, stride_col_dst, stream);
+            return;
+        }
+    }
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
