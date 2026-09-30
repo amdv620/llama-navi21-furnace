@@ -59,7 +59,14 @@ Radeon PRO WX 3200 for the display.
 - **Power:** 300 W through two 8-pin PCIe connectors; AMD recommends a 700 W power supply.
 - **Slot:** PCIe 4.0 x16, dual slot, 267 mm long. Use a CPU-connected x16 slot.
 - **Cooling:** it is built for a server chassis. Check whether your card has its own fan; if it
-  does not, it needs air pushed through it, or it will throttle and shut down.
+  does not, it needs air pushed through it, or it will throttle and shut down. At the 300 W cap
+  (section 4) a sustained long prompt is the hard case: the test machine (a 97 mm blower on a
+  printed shroud plus two 120 mm fans along the card, cool intake air, shroud sealed at the
+  power connectors) settles at a junction of 98 to 99 C against a 100 C limit and loses about
+  1% to the clock trim over an 8-minute prefill; with warm intake air it sat at 100 to 102 C
+  and lost 5 to 8%. The junction sits 22 to 25 C above the edge sensor at this power, which is
+  normal for the die-to-heatsink interface. Short prompts (under about 40k tokens) never reach
+  the limit. Watch `temp2_input` (junction) in the card's hwmon directory.
 - **RAM:** 32 GB is enough; the model lives on the GPU. Disk: about 20 GB for the model files
   (about 80 GB more to rebuild them yourself, section 8).
 
@@ -130,8 +137,10 @@ hung and needed the reset switch).
 What works is a 3-line driver patch (`power/amdgpu-v620-300w.patch`): for PCI device `1002:73a1`
 it raises only the *reported maximum* to 300 W. The default stays 250 W, and setting the cap
 afterwards uses the normal runtime path, a single "set limit" message to the firmware with no
-reset. The firmware honors it: prompt processing then draws 280-300 W at about 2440 MHz (junction
-80 C instead of 72), pp512 470 -> 491 t/s, pp512 at 64k context 246 -> 269 t/s.
+reset. The firmware honors it: prompt processing then draws 280-300 W at about 2440 MHz, pp512
+470 -> 491 t/s, pp512 at 64k context 246 -> 269 t/s. Sustained prefill at 300 W runs the card
+at its thermal limit (see Cooling in section 1); decode is bandwidth-bound and draws 240 to 260 W
+at any cap. The driver accepts caps from 250 to 300 W only.
 
 Build the module (no root needed; the kernel's own headers package supplies the prebuilt pieces,
 so `flex`/`bison` are not required):
